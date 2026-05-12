@@ -24,18 +24,60 @@ from __future__ import annotations
 
 import io
 import logging
-import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import requests
 
-# Re-use the package's shared image compressor.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from kidsnote_diary_suite.publisher.image_compress import compress_image_to_bytes  # noqa: E402
-
 _LOGGER = logging.getLogger(__name__)
+
+
+def compress_image_to_bytes(
+    raw: bytes,
+    target_bytes: int,
+    *,
+    max_side: int = 1920,
+    quality_steps: tuple[int, ...] = (85, 75, 65, 60),
+) -> tuple[bytes, bool]:
+    """Shrink an image so the encoded bytes fit within target_bytes.
+
+    Already small enough → returned as-is, was_compressed=False.
+    Otherwise: EXIF transpose → iterative resize (longest side capped at
+    `max_side`) and JPEG quality step-down until the buffer fits the
+    target, or the smallest setting is reached.
+
+    Returns (bytes, was_compressed).
+    """
+    if len(raw) <= target_bytes:
+        return raw, False
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return raw, False
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+    except Exception:
+        return raw, False
+
+    # Cap the longest side to max_side without enlarging.
+    if max(img.size) > max_side:
+        ratio = max_side / max(img.size)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+
+    for q in quality_steps:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+        data = buf.getvalue()
+        if len(data) <= target_bytes:
+            return data, True
+
+    # Last resort: return the smallest-quality output even if still oversized.
+    return data, True
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
