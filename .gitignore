@@ -1,0 +1,75 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.tox/
+.venv/
+venv/
+env/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Secrets ---
+# NEVER commit WordPress passwords, Notion tokens, LLM API keys.
+.env
+.env.local
+.env.*.local
+
+# --- User config (may contain child name, daycare name, WP URL) ---
+config.yaml
+config.local.yaml
+config.*.local.yaml
+
+# --- State (publish history; may contain child name, daycare name, post IDs) ---
+state.json
+state.*.json
+**/state.json
+
+# --- User data: Kidsnote backups, generated diaries, media caches ---
+# These contain photos and personal information about a real child.
+output/
+outputs/
+generated_diaries/
+backups/
+kidsnote_backup/
+kidsnote_backups/
+kidsnote_backup_*/
+BackupKidsnote/
+uploads_cache.json
+**/uploads_cache.json
+*.docx
+*.pdf
+!docs/**/*.pdf
+
+# --- Persona memory (user-local) ---
+persona/
+personas/
+*.persona.md
+!docs/persona_template_example.md
+
+# --- Personal-only side tooling ---
+# tools/ lives next to the package but is intentionally NOT part of the
+# published OSS — it holds private glue scripts (e.g. tools/kidsnote_fetch/)
+# that hit unofficial Kidsnote endpoints on behalf of the operator only.
+# Excluded from the repo so it never ships via PyPI / GitHub.
+tools/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
