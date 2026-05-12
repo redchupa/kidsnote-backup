@@ -197,7 +197,30 @@ https://www.notion.so/내워크스페이스/238f5e29c0894adfb6c4d8e1a5b2c3d4?v=a
 5. **`limit`** 입력란은 비워둔 채 (또는 처음이라면 `3`을 넣어 안전 확인 후 다시 비워서 실행)
 6. 녹색 **`Run workflow`** 버튼 클릭
 
-5~25분 기다리면 됩니다 (알림장 개수 + 사진 분량에 따라 변동).
+대기 시간은 알림장 개수 + 사진 분량에 따라 다릅니다:
+- 100개 미만: 5~10분
+- 100~300개: 15~40분
+- 300개 이상: 1시간 안팎 (timeout은 2시간으로 설정됨)
+
+### 진행률 실시간 확인
+
+워크플로 실행 중 상태가 궁금하면:
+
+1. Actions 탭 → 실행 중인 run 클릭
+2. **`mirror`** job 클릭 → **`Mirror Kidsnote → Notion`** 스텝 펼치기
+3. 로그가 한 줄씩 출력됩니다:
+
+```
+Notion mirror: 342 total fetched, 137 already in DB (skip), 205 to publish
+Progress   0.5% (1/205) | Notion +1 rid=1390908410 images=0/0
+Progress   1.0% (2/205) | Notion +1 rid=1390273292 images=5/5
+Progress   1.5% (3/205) | Notion +1 rid=1389456123 images=3/3
+...
+Progress  99.5% (204/205) | Notion +1 rid=1234567890 images=2/2
+Notion mirror DONE: 205 new pages, 137 already existed, 0 failed
+```
+
+도중에 멈춰도(timeout, cookie 만료, 네트워크 등) **이미 만들어진 노션 페이지는 그대로 남고**, 다음에 다시 실행하면 중단 지점부터 자동 이어서 백업됩니다.
 
 ✅ 성공 신호:
 - Actions 페이지에서 워크플로 옆 동그라미가 **녹색 체크 ✅**

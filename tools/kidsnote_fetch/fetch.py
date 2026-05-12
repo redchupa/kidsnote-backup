@@ -547,26 +547,39 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Notion mirror (optional) -----
     if mirror is not None:
+        # Pre-count: how many reports are actually new (need publishing) vs
+        # already in Notion DB. Used for percentage progress in the log.
+        to_publish = [r for r in reports if int(r.get("id", 0)) not in skip_ids]
+        already_existed = len(reports) - len(to_publish)
+        total_target = len(to_publish)
+        _LOGGER.info(
+            "Notion mirror: %d total fetched, %d already in DB (skip), %d to publish",
+            len(reports), already_existed, total_target,
+        )
+
         published = 0
         failed = 0
-        for r in reports:
+        for idx, r in enumerate(to_publish, start=1):
             rid = int(r.get("id", 0))
-            if rid in skip_ids:
-                continue
+            pct = (idx / total_target * 100) if total_target else 100.0
             try:
                 result = mirror.publish_report(r, sess)
                 published += 1
                 _LOGGER.info(
-                    "Notion +1: rid=%d images=%d/%d",
-                    rid, result["images_uploaded"],
+                    "Progress %5.1f%% (%d/%d) | Notion +1 rid=%d images=%d/%d",
+                    pct, idx, total_target, rid,
+                    result["images_uploaded"],
                     result["images_uploaded"] + result["images_failed"],
                 )
             except Exception as e:
                 failed += 1
-                _LOGGER.warning("Notion publish failed for rid=%d: %s", rid, e)
+                _LOGGER.warning(
+                    "Progress %5.1f%% (%d/%d) | Notion FAILED rid=%d: %s",
+                    pct, idx, total_target, rid, e,
+                )
         _LOGGER.info(
-            "Notion mirror: %d new pages, %d already existed, %d failed",
-            published, len(skip_ids & {int(r.get("id", 0)) for r in reports}), failed,
+            "Notion mirror DONE: %d new pages, %d already existed, %d failed",
+            published, already_existed, failed,
         )
 
     return 0
