@@ -152,7 +152,17 @@ ACTIVITY_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("🏃 신체활동", ("체조", "운동", "달리기", "뛰기", "체육", "신체놀이",
                      "공놀이", "킥보드", "자전거")),
     ("📅 행사",     ("생일", "졸업", "입학", "운동회", "발표회", "재롱",
-                     "공연", "현장학습", "소풍")),
+                     "공연", "현장학습", "소풍", "참여수업", "공개수업")),
+    ("🎉 기념일",   ("어버이날", "어린이날", "스승의날", "어버이의날",
+                     "어머니의날", "아버지의날", "추석", "설날",
+                     "성탄절", "크리스마스", "핼러윈", "할로윈",
+                     "부활절", "한글날", "광복절", "삼일절")),
+    ("❤️ 감정/표현", ("사랑한다", "안아주", "포옹", "뽀뽀", "사랑해",
+                     "고맙다", "감사", "꼭 안", "토닥")),
+    ("🎓 학습",     ("한글", "숫자", "영어", "수업", "글자",
+                     "배우는", "익히는")),
+    ("🧒 친구관계", ("사이좋게", "양보", "도와주", "친구랑", "또래",
+                     "함께 놀")),
     ("💉 건강",     ("병원", "체온", "감기", "약을", "안전교육", "소방",
                      "지진훈련")),
     ("🏠 가정활동", ("할머니", "할아버지", "외할머니", "외할아버지",
@@ -1090,9 +1100,24 @@ class NotionMirror:
         if categories:
             tail = " · ".join(categories)
         else:
-            # Fallback to keyword summary, then to a fixed label.
+            # Fallback to keyword summary. Strip several variants of the
+            # child's name so it doesn't dominate the keyword list:
+            #   full name (e.g. ``우하린``),
+            #   last 2 chars (``하린``),
+            #   either of those + ``이`` (``하린이`` is what teachers write).
             cname = report.get("child_name") or ""
-            stripped = body_text.replace(cname, "") if cname else body_text
+            stripped = body_text
+            if cname:
+                variants = {cname, cname + "이", cname + "이가",
+                            cname + "이는", cname + "이의"}
+                if len(cname) >= 2:
+                    short = cname[-2:]
+                    variants.update({short, short + "이",
+                                     short + "이가", short + "이는"})
+                # Apply longer variants first so we don't accidentally
+                # leave dangling "이"s.
+                for v in sorted(variants, key=len, reverse=True):
+                    stripped = stripped.replace(v, "")
             summary = self._summarize_text(stripped)
             tail = summary or f"알림장 #{report_id}"
 
