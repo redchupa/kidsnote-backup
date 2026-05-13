@@ -1129,7 +1129,7 @@ class NotionMirror:
             tail = summary or f"알림장 #{report_id}"
 
         prefix_emojis = author_icon + (f" {w_emoji}" if w_emoji else "")
-        title = f"[{date_str}] {prefix_emojis} {tail}"
+        title = f"[{date_str}] 알림장: {prefix_emojis} {tail}"
 
         # Upload photos first so we can drop image blocks into the page body.
         image_upload_ids: list[str] = []
