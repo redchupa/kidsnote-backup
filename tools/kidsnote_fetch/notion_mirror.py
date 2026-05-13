@@ -84,6 +84,35 @@ NOTION_VERSION = "2022-06-28"
 DEFAULT_MAX_IMAGE_BYTES = 5_000_000   # Notion free-tier per-file cap.
 MAX_BLOCK_TEXT = 1900                 # Notion paragraph rich_text limit (2000).
 
+# Kidsnote life-record status codes → human Korean. Unknown values are
+# rendered as-is, so missing entries here just degrade gracefully.
+SLEEP_HOUR_KO = {
+    "none": "안 잠",
+    "under_30m": "30분 이내",
+    "30m_to_1": "30분~1시간",
+    "1_to_1.5": "1~1.5시간",
+    "1.5_to_2": "1.5~2시간",
+    "over_2": "2시간 이상",
+}
+STATUS_KO = {
+    "good": "좋음",
+    "average": "보통",
+    "bad": "안 좋음",
+    "normal": "정상",
+    "high": "높음",
+    "low": "낮음",
+    "soft": "묽음",
+    "hard": "딱딱",
+    "none": "없음",
+    "fixed": "정해진 식단",
+    "sick": "아픔",
+    "fine": "양호",
+    "trimmed": "정리됨",
+    "needs_trim": "정리 필요",
+    "active": "활발",
+    "calm": "차분",
+}
+
 # The target database's actual property names are discovered at runtime via
 # `GET /v1/databases/{id}`. This lets the Notion Korean UI's auto-translated
 # defaults ("이름", "날짜") and user-chosen variants ("리포트 ID") work
@@ -484,16 +513,221 @@ class NotionMirror:
 
     # ----------------------------------------------------------- publish
 
+    @staticmethod
+    def _summarize_text(text: str, max_chars: int = 70) -> str:
+        """Pick a readable one-line summary out of an alimnota body.
+
+        Strategy:
+        1. Strip / flatten whitespace.
+        2. Try to cut at the first sentence terminator (Korean and Latin).
+        3. Otherwise hard-truncate at ``max_chars`` and append an ellipsis.
+        """
+        if not text:
+            return ""
+        flat = " ".join(text.split())  # collapse all whitespace
+        for delim in ("다. ", "요. ", "다.", "요.", ".", "!", "?", "♡"):
+            idx = flat.find(delim)
+            if 10 < idx < max_chars:
+                return flat[: idx + len(delim)].rstrip()
+        if len(flat) > max_chars:
+            return flat[:max_chars].rstrip() + "..."
+        return flat
+
+    @staticmethod
+    def _life_record_bits(report: dict[str, Any]) -> list[str]:
+        """Convert the detail-API life-record codes into human Korean chips.
+
+        Only non-empty / informative fields produce a chip. Mapping for
+        `*_status` enum codes is best-effort (STATUS_KO); unknown values
+        fall through as the original code so they don't disappear silently.
+        """
+        bits: list[str] = []
+
+        def to_ko(value: str | None) -> str | None:
+            if not value:
+                return None
+            return STATUS_KO.get(value, value)
+
+        meal = to_ko(report.get("meal_status"))
+        if meal:
+            bits.append(f"🍽️ 식사 {meal}")
+
+        sh = report.get("sleep_hour")
+        if sh:
+            bits.append(f"💤 수면 {SLEEP_HOUR_KO.get(sh, sh)}")
+
+        bowel = to_ko(report.get("bowel_status"))
+        if bowel:
+            bits.append(f"💩 배변 {bowel}")
+
+        temp_status = to_ko(report.get("temperature_status"))
+        if temp_status:
+            bits.append(f"🌡️ 체온 {temp_status}")
+        # Numeric temperature if present (some kidsnote setups record actual °C)
+        temp = report.get("temperature")
+        if temp not in (None, "", 0):
+            bits.append(f"🌡️ {temp}°C")
+
+        mood = to_ko(report.get("mood_status"))
+        if mood:
+            bits.append(f"😊 기분 {mood}")
+
+        health = to_ko(report.get("health_status"))
+        if health:
+            bits.append(f"💊 건강 {health}")
+
+        outdoor = to_ko(report.get("outdoor_activity_status"))
+        if outdoor:
+            bits.append(f"🏃 야외활동 {outdoor}")
+
+        bath = to_ko(report.get("bath_status"))
+        if bath:
+            bits.append(f"🛁 목욕 {bath}")
+
+        nail = to_ko(report.get("nail_status"))
+        if nail:
+            bits.append(f"💅 손톱 {nail}")
+
+        ar = report.get("activity_rate")
+        if ar not in (None, "", 0):
+            bits.append(f"⭐ 활동 {ar}")
+
+        return bits
+
+    @staticmethod
+    def _life_record_detail_blocks(
+        report: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Tabular entries for food/sleep/nursing arrays — one paragraph per row.
+
+        Only includes sections that have at least one entry. Each row is a
+        single colored paragraph so the page reads like a timeline.
+        """
+        out: list[dict[str, Any]] = []
+
+        food = report.get("food") or []
+        if isinstance(food, list) and food:
+            out.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "🍽️ 식사 기록"}}]},
+            })
+            for f in food:
+                if not isinstance(f, dict):
+                    continue
+                t = f.get("time_meal") or ""
+                name = f.get("name") or ""
+                line = f"{t}  {name}".strip()
+                if line:
+                    out.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                    })
+
+        sleep = report.get("sleep") or []
+        if isinstance(sleep, list) and sleep:
+            out.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "💤 낮잠"}}]},
+            })
+            for s in sleep:
+                if not isinstance(s, dict):
+                    continue
+                start = s.get("time_start") or ""
+                end = s.get("time_end") or ""
+                line = f"{start} ~ {end}".strip(" ~")
+                if line:
+                    out.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                    })
+
+        nursing = report.get("nursing") or []
+        if isinstance(nursing, list) and nursing:
+            out.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "🍼 수유"}}]},
+            })
+            for n in nursing:
+                if not isinstance(n, dict):
+                    continue
+                t = n.get("time_nursing") or ""
+                vol = n.get("volume")
+                line = f"{t}  {vol}ml" if vol else t
+                if line:
+                    out.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                    })
+
+        bowel = report.get("bowel") or []
+        if isinstance(bowel, list) and bowel:
+            out.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "💩 배변 기록"}}]},
+            })
+            for b in bowel:
+                if not isinstance(b, dict):
+                    continue
+                line = json.dumps(b, ensure_ascii=False)
+                out.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                })
+
+        return out
+
+    def _menu_summary_blocks(self, menu: dict[str, Any]) -> list[dict[str, Any]]:
+        """Compact text-only summary of a daily menu for inline embedding
+        inside a report page. Photos of food are intentionally omitted to
+        keep report pages from doubling in size — full menu (with photos)
+        is still available as a separate menu page if the matching date
+        has no report.
+        """
+        out: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": [{"type": "text", "text": {"content": "🍱 오늘의 식단"}}]},
+        }]
+        for text_field, _img_field, label in self.MEAL_FIELDS:
+            text = (menu.get(text_field) or "").strip()
+            if not text:
+                continue
+            one_line = " · ".join(p for p in text.split("\n") if p.strip())
+            out.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"{label}: "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": one_line}},
+                ]},
+            })
+        return out
+
     def publish_report(
         self,
         report: dict[str, Any],
         kidsnote_sess: requests.Session,
+        *,
+        attached_menu: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a Notion page for one Kidsnote report.
 
         Returns a dict with `{page_id, title, images_uploaded, images_failed}`.
         Caller is responsible for skipping reports whose id is already in the DB
         (see `existing_report_ids`).
+
+        ``attached_menu``: optional matching daily menu (same date as report).
+        When provided, a compact text-only menu summary is appended inside
+        the report body so a single page captures both the teacher's notes
+        and what the child ate / what was on the daily menu.
         """
         report_id = int(report["id"])
         date_str = (
@@ -502,7 +736,8 @@ class NotionMirror:
             or (report.get("created") or "")[:10]
             or datetime.now().date().isoformat()
         )
-        title = f"[{date_str}] 알림장 #{report_id}"
+        summary = self._summarize_text(report.get("content") or "")
+        title = f"[{date_str}] {summary}" if summary else f"[{date_str}] 알림장 #{report_id}"
 
         # Upload photos first so we can drop image blocks into the page body.
         image_upload_ids: list[str] = []
@@ -599,6 +834,36 @@ class NotionMirror:
         children = self._build_children(
             report, image_upload_ids, video_upload_ids, file_upload_ids,
         )
+
+        # Append life-record chips to the meta paragraph (first gray paragraph).
+        life_bits = self._life_record_bits(report)
+        if life_bits and children and children[0].get("type") == "paragraph":
+            rt = children[0]["paragraph"]["rich_text"]
+            base = rt[0]["text"]["content"] if rt else ""
+            merged = (base + " · " if base else "") + " · ".join(life_bits)
+            children[0]["paragraph"]["rich_text"] = [{
+                "type": "text",
+                "text": {"content": merged},
+                "annotations": {"color": "gray"},
+            }]
+
+        # Insert life-record detail blocks (food/sleep/nursing timelines) +
+        # daily menu summary (if provided) before the attachment sections.
+        # Attachment sections start at the first heading_3 named '사진'/'동영상'/'첨부 파일'.
+        extras: list[dict[str, Any]] = []
+        extras.extend(self._life_record_detail_blocks(report))
+        if attached_menu:
+            extras.extend(self._menu_summary_blocks(attached_menu))
+        if extras:
+            insert_idx = len(children)
+            attachment_headings = {"사진", "동영상", "첨부 파일"}
+            for i, blk in enumerate(children):
+                if blk.get("type") == "heading_3":
+                    rt = blk["heading_3"]["rich_text"]
+                    if rt and rt[0].get("text", {}).get("content") in attachment_headings:
+                        insert_idx = i
+                        break
+            children = children[:insert_idx] + extras + children[insert_idx:]
 
         # Resolve property names on first publish (cached for subsequent calls).
         self._resolve_schema()
@@ -912,7 +1177,16 @@ class NotionMirror:
         """
         menu_id = int(menu["id"])
         date_str = menu.get("date_menu") or (menu.get("modified") or "")[:10]
-        title = f"[{date_str}] 식단표"
+        # Title: include lunch summary if present (most informative meal).
+        lunch_text = (menu.get("lunch") or "").strip()
+        lunch_summary = ""
+        if lunch_text:
+            # Take first 2-3 menu items joined with comma.
+            items = [s.strip() for s in lunch_text.split("\n") if s.strip()]
+            lunch_summary = ", ".join(items[:3])
+            if len(items) > 3:
+                lunch_summary += " 외"
+        title = f"[{date_str}] 🍱 {lunch_summary}" if lunch_summary else f"[{date_str}] 식단표"
 
         # Build body + upload meal photos (each meal has at most 1 image).
         blocks: list[dict[str, Any]] = []

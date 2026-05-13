@@ -149,6 +149,24 @@ def _list_reports(
     return body.get("results") or body.get("reports") or []
 
 
+def _fetch_report_detail(
+    sess: requests.Session, report_id: int
+) -> dict[str, Any] | None:
+    """Single-report endpoint returns ~15 extra `life record` fields
+    (meal/sleep/bowel/temperature/mood/etc) that the list endpoint omits.
+
+    Confirmed live: ``GET /api/v1_2/reports/<id>/``. Returns ``None`` on error
+    so the caller can fall back to the summary record from the list call.
+    """
+    try:
+        r = sess.get(f"{API}/reports/{report_id}/", timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        _LOGGER.warning("report detail fetch failed for id=%d: %s", report_id, e)
+        return None
+
+
 def _list_menus(
     sess: requests.Session, center_id: int, page_size: int = 9999
 ) -> list[dict[str, Any]]:
@@ -574,9 +592,40 @@ def main(argv: list[str] | None = None) -> int:
     elif isinstance(enr, dict):
         center_id = enr.get("center_id") or enr.get("center")
 
+    # ---- Pre-fetch daily menus once, so reports can embed the matching
+    # ----- day's menu summary inline. Menus matched to a report are
+    # ----- removed from the standalone-publish pool below.
+    menus_for_match: dict[str, dict[str, Any]] = {}
+    menus_fetched: list[dict[str, Any]] = []
+    if mirror is not None and not args.no_menus and center_id:
+        try:
+            menus_fetched = _list_menus(sess, int(center_id))
+            if args.limit:
+                menus_fetched = menus_fetched[: args.limit * 3]
+            for m in menus_fetched:
+                d = m.get("date_menu")
+                if d:
+                    menus_for_match[d] = m
+            _LOGGER.info("pre-loaded %d daily menus (matching by date_menu)",
+                         len(menus_for_match))
+        except Exception as e:
+            _LOGGER.warning("menu pre-fetch failed: %s", e)
+
+    matched_menu_ids: set[int] = set()
+
     # ---- Notion mirror: alimnota reports -----
     if mirror is not None:
-        _publish_batch(reports, mirror.publish_report, "Report")
+        def _publish_report_enriched(report: dict[str, Any], sess_: requests.Session) -> dict[str, Any]:
+            # 1) Enrich with detail fields (meal_status, sleep_hour, etc).
+            detail = _fetch_report_detail(sess_, int(report["id"])) or report
+            # 2) Find same-day menu (if any) and remove from standalone pool.
+            date_w = detail.get("date_written")
+            attached_menu = menus_for_match.get(date_w) if date_w else None
+            if attached_menu:
+                matched_menu_ids.add(int(attached_menu["id"]))
+            return mirror.publish_report(detail, sess_, attached_menu=attached_menu)
+
+        _publish_batch(reports, _publish_report_enriched, "Report")
 
     # ---- Notion mirror: notices (center-wide) -----
     if mirror is not None and not args.no_notices and center_id:
@@ -600,16 +649,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             _LOGGER.warning("album fetch failed: %s", e)
 
-    # ---- Notion mirror: daily lunch menus -----
-    if mirror is not None and not args.no_menus and center_id:
-        try:
-            menus = _list_menus(sess, int(center_id))
-            if args.limit:
-                menus = menus[: args.limit]
-            _LOGGER.info("fetched %d daily menus for center id=%s", len(menus), center_id)
-            _publish_batch(menus, mirror.publish_menu, "Menu")
-        except Exception as e:
-            _LOGGER.warning("menu fetch failed: %s", e)
+    # ---- Notion mirror: daily lunch menus (only those NOT matched into a report) -----
+    if mirror is not None and not args.no_menus and center_id and menus_fetched:
+        # Skip menus that were already embedded into a same-day report.
+        standalone_menus = [m for m in menus_fetched if int(m["id"]) not in matched_menu_ids]
+        _LOGGER.info(
+            "Menu standalone: %d (%d embedded inside reports)",
+            len(standalone_menus), len(matched_menu_ids),
+        )
+        if args.limit:
+            standalone_menus = standalone_menus[: args.limit]
+        _publish_batch(standalone_menus, mirror.publish_menu, "Menu")
 
     return 0
 
