@@ -913,6 +913,60 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             _LOGGER.warning("nutrition publish failed: %s", e)
 
+    # ---- 📖 매월 성장 스토리 / 🌟 마일스톤 / 🌱 분기 관심사 / 💌 감사 카드
+    # ---- (LLM-driven; auto-skipped when Ollama isn't reachable) ----
+    if mirror is not None and reports:
+        cname = (reports[0].get("child_name") or "") if reports else ""
+
+        # Group by month + quarter
+        from collections import defaultdict
+        by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        by_quarter: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in reports:
+            d = r.get("date_written") or ""
+            if len(d) < 7:
+                continue
+            ym = d[:7]
+            by_month[ym].append(r)
+            try:
+                year, month = int(d[:4]), int(d[5:7])
+                q = (month - 1) // 3 + 1
+                by_quarter[f"{year} Q{q}"].append(r)
+            except (ValueError, TypeError):
+                pass
+
+        _LOGGER.info("📖 Growth story: %d months", len(by_month))
+        try:
+            res = mirror.publish_growth_story(by_month, cname)
+            _LOGGER.info("📖 Growth story page: %s",
+                         "OK" if res else "skipped (Ollama unavailable)")
+        except Exception as e:
+            _LOGGER.warning("growth story publish failed: %s", e)
+
+        _LOGGER.info("🌟 Milestones: scanning %d reports...", len(reports))
+        try:
+            res = mirror.publish_milestones(reports, cname)
+            _LOGGER.info("🌟 Milestones page: %s",
+                         "OK" if res else "skipped (Ollama unavailable)")
+        except Exception as e:
+            _LOGGER.warning("milestones publish failed: %s", e)
+
+        _LOGGER.info("🌱 Interests: %d quarters", len(by_quarter))
+        try:
+            res = mirror.publish_interests(by_quarter, cname)
+            _LOGGER.info("🌱 Interests page: %s",
+                         "OK" if res else "skipped (Ollama unavailable)")
+        except Exception as e:
+            _LOGGER.warning("interests publish failed: %s", e)
+
+        _LOGGER.info("💌 Teacher thanks: composing letter...")
+        try:
+            res = mirror.publish_teacher_thanks(reports, cname)
+            _LOGGER.info("💌 Teacher thanks page: %s",
+                         "OK" if res else "skipped (Ollama unavailable or no teacher posts)")
+        except Exception as e:
+            _LOGGER.warning("teacher thanks publish failed: %s", e)
+
     return 0
 
 

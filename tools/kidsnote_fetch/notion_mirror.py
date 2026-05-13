@@ -585,9 +585,10 @@ class NotionMirror:
         if meta_bits:
             blocks.append(self._para(" · ".join(meta_bits), color="gray"))
 
-        # LLM one-liner summary (only when Ollama available; no LLM, no
-        # callout — keeps the page free of misleading text).
+        # LLM-driven callouts (only when Ollama available). Skipped gracefully
+        # when no LLM is reachable so non-LLM users still get a clean page.
         body_for_summary = (report.get("content") or "").strip()
+        cname = report.get("child_name") or ""
         if body_for_summary:
             oneliner = self._summary_oneliner(body_for_summary)
             if oneliner:
@@ -598,6 +599,32 @@ class NotionMirror:
                         "rich_text": [{"type": "text", "text": {"content": oneliner}}],
                         "icon": {"type": "emoji", "emoji": "💭"},
                         "color": "purple_background",
+                    },
+                })
+            # Child first-person diary
+            child_diary = self._child_voice_diary(body_for_summary, cname)
+            if child_diary:
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [{"type": "text", "text": {"content": child_diary}}],
+                        "icon": {"type": "emoji", "emoji": "🧒"},
+                        "color": "yellow_background",
+                    },
+                })
+            # Parent diary (imagined; works whether the report itself was
+            # parent- or teacher-written — kidsnote shows the alimnota to
+            # the family either way).
+            parent_diary = self._parent_voice_diary(body_for_summary, cname)
+            if parent_diary:
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [{"type": "text", "text": {"content": parent_diary}}],
+                        "icon": {"type": "emoji", "emoji": "👨‍👩‍👧"},
+                        "color": "pink_background",
                     },
                 })
 
@@ -840,6 +867,78 @@ class NotionMirror:
         if kiwi is not None:
             return cls._summarize_text_kiwi(kiwi, text, max_chars)
         return cls._summarize_text_heuristic(text, max_chars)
+
+    @classmethod
+    def _ask_ollama(
+        cls,
+        prompt: str,
+        *,
+        max_chars: int = 400,
+        temperature: float = 0.3,
+        num_predict: int = 200,
+        timeout: int = 120,
+    ) -> str | None:
+        """Generic Ollama text-generation call. Returns None when Ollama
+        isn't reachable or the response is empty / garbage. Output is
+        stripped to a single contiguous block and capped at ``max_chars``.
+        """
+        cfg = _get_ollama()
+        if cfg is None:
+            return None
+        try:
+            r = requests.post(
+                f"{cfg['host']}/api/generate",
+                json={
+                    "model": cfg["model"],
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": num_predict,
+                    },
+                },
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            out = (r.json().get("response") or "").strip()
+        except Exception as e:
+            logging.getLogger(__name__).debug("ollama call failed: %s", e)
+            return None
+        if not out:
+            return None
+        # Drop wrapping ``"`` and leading dashes/asterisks
+        out = out.strip().strip('"').strip("'").lstrip("- ").lstrip("* ").strip()
+        if len(out) < 5:
+            return None
+        return out[:max_chars]
+
+    @classmethod
+    def _child_voice_diary(cls, text: str, child_name: str = "") -> str | None:
+        """Convert teacher's alimnota into child's first-person diary."""
+        if not text or len(text.strip()) < 30:
+            return None
+        name_hint = f" 자녀 이름은 ``{child_name}``." if child_name else ""
+        prompt = (
+            "다음 어린이집 알림장 본문을 자녀의 1인칭(``나``) 시점 일기로 "
+            "한국어로 짧게(2-3문장) 바꿔써. 어린이 어휘로 자연스럽게."
+            f"{name_hint} 다른 설명 없이 일기 본문만 답해.\n\n"
+            f"본문: {text[:1500]}\n\n자녀의 일기:"
+        )
+        return cls._ask_ollama(prompt, max_chars=350, num_predict=120)
+
+    @classmethod
+    def _parent_voice_diary(cls, text: str, child_name: str = "") -> str | None:
+        """Generate the parent's would-be diary entry inspired by today's alimnota."""
+        if not text or len(text.strip()) < 30:
+            return None
+        name_hint = f" 자녀 이름은 ``{child_name}``." if child_name else ""
+        prompt = (
+            "다음은 어린이집에서 받은 알림장 본문이야. 부모의 입장에서 "
+            "그날 자녀를 떠올리며 쓰는 짧은 일기(2-3문장)를 따뜻한 톤으로 "
+            f"써줘.{name_hint} 다른 설명 없이 일기 본문만 답해.\n\n"
+            f"알림장: {text[:1500]}\n\n부모의 일기:"
+        )
+        return cls._ask_ollama(prompt, max_chars=350, num_predict=120)
 
     @classmethod
     def _summary_oneliner(cls, text: str) -> str | None:
@@ -1940,6 +2039,15 @@ class NotionMirror:
     MEMORIES_TITLE = "📅 오늘의 추억"
     NUTRITION_REPORT_ID = -3
     NUTRITION_TITLE = "🥗 영양 분석"
+    # LLM-driven storytelling pages (auto-skip when Ollama isn't reachable)
+    GROWTH_STORY_REPORT_ID = -4
+    GROWTH_STORY_TITLE = "📖 매월 성장 스토리"
+    MILESTONES_REPORT_ID = -5
+    MILESTONES_TITLE = "🌟 우리 아이의 처음들 (마일스톤)"
+    INTERESTS_REPORT_ID = -6
+    INTERESTS_TITLE = "🌱 분기별 관심사"
+    TEACHER_THANKS_REPORT_ID = -7
+    TEACHER_THANKS_TITLE = "💌 선생님께"
 
     def _find_singleton_page(self, sentinel_report_id: int) -> str | None:
         """Locate an existing system singleton page by its sentinel Report ID."""
@@ -2435,6 +2543,263 @@ NUTRITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "과자", "비스킷", "타르트",
     )),
 )
+
+
+    # ----------------------------------------------------------- LLM dashboards
+
+    def _replace_singleton(
+        self,
+        report_id: int,
+        title: str,
+        blocks: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Archive any existing page with ``Report ID == report_id`` and
+        create a fresh one with the given title + body blocks. Shared
+        helper for all four LLM dashboard pages.
+        """
+        existing = self._find_singleton_page(report_id)
+        if existing:
+            self._archive_page(existing)
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        props: dict[str, Any] = {
+            self._prop_title: {"title": [{"text": {"content": title[:200]}}]},
+            self._prop_report_id: {"number": report_id},
+        }
+        if self._prop_date:
+            props[self._prop_date] = {
+                "date": {"start": datetime.now().date().isoformat()},
+            }
+        try:
+            r = self.session.post(
+                f"{NOTION_API}/pages",
+                headers=self._headers(),
+                json={
+                    "parent": {"database_id": self.database_id},
+                    "properties": props,
+                    "children": blocks,
+                },
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            _LOGGER.warning("singleton page publish failed (%s): %s", title, e)
+            return None
+
+    def publish_growth_story(
+        self,
+        reports_by_month: dict[str, list[dict[str, Any]]],
+        child_name: str = "",
+    ) -> dict[str, Any] | None:
+        """📖 매월 성장 스토리. One paragraph per month, LLM-generated."""
+        if _get_ollama() is None:
+            return None
+        blocks: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": f"매월 한 단락. LLM이 그 달 알림장을 보고 따뜻한 톤의 성장 스토리를 작성합니다.\n마지막 갱신: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                }}],
+                "icon": {"type": "emoji", "emoji": "📖"},
+                "color": "blue_background",
+            },
+        }]
+        for ym in sorted(reports_by_month.keys()):
+            items = reports_by_month[ym]
+            if not items:
+                continue
+            # Build a compact joined text for LLM
+            joined = "\n\n".join(
+                (r.get("content") or "").strip()[:300] for r in items[:30]
+            )[:4500]
+            prompt = (
+                f"다음은 어린이집 자녀의 {ym} 한 달치 알림장 모음이야. "
+                "이를 바탕으로 그 달의 자녀 성장 스토리를 따뜻한 톤의 "
+                "한 단락(3-4문장)으로 한국어로 써줘. "
+                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
+                "다른 설명 없이 본문만 답해.\n\n"
+                f"알림장 모음:\n{joined}\n\n성장 스토리:"
+            )
+            story = self._ask_ollama(prompt, max_chars=600, num_predict=300, timeout=180)
+            if not story:
+                continue
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{
+                    "type": "text",
+                    "text": {"content": f"📅 {ym}"},
+                }]},
+            })
+            for chunk in self._chunk(story):
+                blocks.append(self._para(chunk))
+        return self._replace_singleton(
+            self.GROWTH_STORY_REPORT_ID, self.GROWTH_STORY_TITLE, blocks,
+        )
+
+    def publish_milestones(
+        self,
+        reports: list[dict[str, Any]],
+        child_name: str = "",
+    ) -> dict[str, Any] | None:
+        """🌟 마일스톤. LLM이 ``처음 ...`` 패턴을 본문에서 추출.
+
+        Iterates every report; LLM responds with one short line or ``없음``.
+        Heavy (1 call per report) but valuable.
+        """
+        if _get_ollama() is None:
+            return None
+        intro = (
+            f"마지막 갱신: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"알림장 {len(reports)}개를 분석해 자녀의 발달 마일스톤(처음 ...)을 추출했습니다."
+        )
+        blocks: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": intro}}],
+                "icon": {"type": "emoji", "emoji": "🌟"},
+                "color": "yellow_background",
+            },
+        }]
+        # Sort oldest → newest so milestones read chronologically
+        ordered = sorted(reports, key=lambda r: (r.get("date_written") or ""))
+        seen_milestones: set[str] = set()
+        for r in ordered:
+            body = (r.get("content") or "").strip()
+            if not body or len(body) < 40:
+                continue
+            date = (r.get("date_written") or "")[:10]
+            prompt = (
+                "다음 어린이집 알림장 본문에서 자녀가 "
+                "``처음으로 X를 했다`` 류의 발달 마일스톤이 있다면 "
+                "한 줄(15자 이내)로 추출해. 없으면 ``없음`` 한 단어만 답해. "
+                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''}\n\n"
+                f"본문: {body[:1200]}\n\n마일스톤:"
+            )
+            ms = self._ask_ollama(prompt, max_chars=60, num_predict=40, timeout=60)
+            if not ms or ms.strip() in ("없음", "없다", "없습니다", "없어요"):
+                continue
+            ms = ms.split("\n")[0].strip()
+            # Dedup similar milestones (case-insensitive substring)
+            ms_key = ms.lower()
+            if any(ms_key in s or s in ms_key for s in seen_milestones):
+                continue
+            seen_milestones.add(ms_key)
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"📅 {date}  "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": ms}},
+                ]},
+            })
+        return self._replace_singleton(
+            self.MILESTONES_REPORT_ID, self.MILESTONES_TITLE, blocks,
+        )
+
+    def publish_interests(
+        self,
+        reports_by_quarter: dict[str, list[dict[str, Any]]],
+        child_name: str = "",
+    ) -> dict[str, Any] | None:
+        """🌱 분기별 관심사 TOP 5. 4 LLM calls (per quarter)."""
+        if _get_ollama() is None:
+            return None
+        blocks: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": f"분기별로 자녀가 가장 좋아한 활동/사물/사람 TOP 5.\n마지막 갱신: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                }}],
+                "icon": {"type": "emoji", "emoji": "🌱"},
+                "color": "green_background",
+            },
+        }]
+        for q in sorted(reports_by_quarter.keys()):
+            items = reports_by_quarter[q]
+            if not items:
+                continue
+            joined = "\n".join(
+                (r.get("content") or "").strip()[:250] for r in items[:40]
+            )[:5000]
+            prompt = (
+                f"다음은 어린이집 자녀의 {q} 분기 알림장 모음이야. "
+                "자녀가 이 기간 가장 좋아한 활동·사물·사람을 TOP 5로 정리해. "
+                "각 항목은 한 줄로 ``1. ... `` ``2. ...`` 형태로. "
+                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
+                "다른 설명 없이 목록만 답해.\n\n"
+                f"알림장:\n{joined}\n\nTOP 5:"
+            )
+            top = self._ask_ollama(prompt, max_chars=400, num_predict=200, timeout=120)
+            if not top:
+                continue
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{
+                    "type": "text", "text": {"content": f"🌱 {q}"},
+                }]},
+            })
+            for line in top.split("\n"):
+                line = line.strip()
+                if line:
+                    blocks.append(self._para(line))
+        return self._replace_singleton(
+            self.INTERESTS_REPORT_ID, self.INTERESTS_TITLE, blocks,
+        )
+
+    def publish_teacher_thanks(
+        self,
+        reports: list[dict[str, Any]],
+        child_name: str = "",
+    ) -> dict[str, Any] | None:
+        """💌 선생님께 감사 카드. 1 LLM call from the whole year's
+        teacher-written alimnota → a draft thank-you letter."""
+        if _get_ollama() is None:
+            return None
+        teacher_reports = [
+            r for r in reports
+            if ((r.get("author") or {}).get("type") or "") == "teacher"
+        ]
+        if not teacher_reports:
+            return None
+        # Most-recent first, take up to 60 to fit context
+        teacher_reports = sorted(
+            teacher_reports, key=lambda r: r.get("date_written") or "", reverse=True,
+        )[:60]
+        joined = "\n\n".join(
+            (r.get("content") or "").strip()[:300] for r in teacher_reports
+        )[:8000]
+        prompt = (
+            "다음은 어린이집 선생님이 1년 동안 작성한 알림장 모음이야. "
+            "이 선생님께 보낼 진심 어린 감사 편지를 한국어로 5-6문장으로 "
+            f"써줘. {'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
+            "편지 본문만 답해.\n\n"
+            f"알림장 모음:\n{joined}\n\n감사 편지:"
+        )
+        letter = self._ask_ollama(prompt, max_chars=900, num_predict=400, timeout=180)
+        if not letter:
+            return None
+        blocks: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": f"1년치 알림장 기반 감사 편지 초안. 졸업·연말 시 가족이 다듬어 사용.\n마지막 갱신: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                }}],
+                "icon": {"type": "emoji", "emoji": "💌"},
+                "color": "purple_background",
+            },
+        }]
+        for chunk in self._chunk(letter):
+            blocks.append(self._para(chunk))
+        return self._replace_singleton(
+            self.TEACHER_THANKS_REPORT_ID, self.TEACHER_THANKS_TITLE, blocks,
+        )
 
 
 __all__ = ["NotionMirror", "DEFAULT_MAX_IMAGE_BYTES"]
