@@ -42,7 +42,11 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Long timeout: a 1-year backfill with photo-heavy reports
+    # (avg 15-25 images/report) can take 2-3 hours. GitHub-hosted
+    # runners cap at 6 hours; public repos pay nothing for that.
+    # Re-runs after the first backfill are fast (dedup skips done).
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
