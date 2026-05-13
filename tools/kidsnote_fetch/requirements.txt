@@ -1,2 +1,3 @@
 requests>=2.31
 browser-cookie3>=0.20
+kiwipiepy>=0.17

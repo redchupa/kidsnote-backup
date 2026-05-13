@@ -31,6 +31,64 @@ from typing import Any
 
 import requests
 
+# Lazy-loaded global kiwipiepy instance. The first call to ``_get_kiwi()``
+# initializes the analyzer (loads the Korean morphology dictionary; ~80MB
+# one-time). All subsequent calls reuse the same instance.
+_KIWI_INSTANCE: Any = None
+_KIWI_TRIED = False
+# Ollama availability is checked once per process. If the env var
+# OLLAMA_HOST is set AND /api/version responds, we mark it usable.
+_OLLAMA_CONFIG: dict[str, str] | None = None
+_OLLAMA_TRIED = False
+
+
+def _get_kiwi() -> Any:
+    """Return a shared Kiwi instance, or None if kiwipiepy is unavailable."""
+    global _KIWI_INSTANCE, _KIWI_TRIED
+    if _KIWI_TRIED:
+        return _KIWI_INSTANCE
+    _KIWI_TRIED = True
+    try:
+        from kiwipiepy import Kiwi  # type: ignore[import-not-found]
+        _KIWI_INSTANCE = Kiwi()
+        logging.getLogger(__name__).info("kiwipiepy loaded for keyword extraction")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "kiwipiepy not available, falling back to heuristic keywords: %s", e,
+        )
+        _KIWI_INSTANCE = None
+    return _KIWI_INSTANCE
+
+
+def _get_ollama() -> dict[str, str] | None:
+    """Return ``{host, model}`` if a reachable Ollama server is configured
+    via env vars, otherwise None. Result is cached for the process lifetime.
+    """
+    global _OLLAMA_CONFIG, _OLLAMA_TRIED
+    if _OLLAMA_TRIED:
+        return _OLLAMA_CONFIG
+    _OLLAMA_TRIED = True
+    import os
+    host = os.environ.get("OLLAMA_HOST")
+    model = os.environ.get("OLLAMA_MODEL") or "qwen2.5:1.5b"
+    if not host:
+        return None
+    # Probe /api/version with a short timeout — fail fast.
+    try:
+        r = requests.get(f"{host.rstrip('/')}/api/version", timeout=5)
+        r.raise_for_status()
+        _OLLAMA_CONFIG = {"host": host.rstrip("/"), "model": model}
+        logging.getLogger(__name__).info(
+            "Ollama available at %s (model=%s) for keyword extraction",
+            host, model,
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "OLLAMA_HOST set but unreachable, falling back to kiwi/heuristic: %s", e,
+        )
+        _OLLAMA_CONFIG = None
+    return _OLLAMA_CONFIG
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -527,9 +585,28 @@ class NotionMirror:
         if meta_bits:
             blocks.append(self._para(" · ".join(meta_bits), color="gray"))
 
-        # Weather callout — only when the daycare actually filled in the
-        # weather field. No body-text inference (per design: ``있는 그대로``).
-        w_code = report.get("weather")
+        # LLM one-liner summary (only when Ollama available; no LLM, no
+        # callout — keeps the page free of misleading text).
+        body_for_summary = (report.get("content") or "").strip()
+        if body_for_summary:
+            oneliner = self._summary_oneliner(body_for_summary)
+            if oneliner:
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [{"type": "text", "text": {"content": oneliner}}],
+                        "icon": {"type": "emoji", "emoji": "💭"},
+                        "color": "purple_background",
+                    },
+                })
+
+        # Weather callout — only for teacher/admin posts (kidsnote auto-fills
+        # weather on parent posts too, which would be misleading) and only
+        # when the daycare actually filled in the weather field.
+        # No body-text inference (per design: ``있는 그대로``).
+        _atype = (report.get("author") or {}).get("type") or ""
+        w_code = report.get("weather") if _atype != "parent" else None
         if w_code:
             w_display = WEATHER_KO.get(w_code, w_code)
             blocks.append({
@@ -632,7 +709,11 @@ class NotionMirror:
                    "까지", "부터", "이라", "라고", "이고", "이며", "이지",
                    "에는", "에도", "에만", "은데", "는데")
     _PARTICLE_1 = ("을", "를", "이", "가", "은", "는", "도", "만",
-                   "의", "에", "와", "과", "로", "랑", "야", "여", "께")
+                   "의", "에", "와", "과", "로", "랑", "야", "여", "께",
+                   # ``때`` is technically a noun but reads like a temporal
+                   # particle in alimnota text ("그 때", "돌잔치때") and
+                   # stripping it gives a much cleaner keyword.
+                   "때")
 
     @classmethod
     def _strip_particle(cls, word: str) -> str:
@@ -659,6 +740,9 @@ class NotionMirror:
         # Final endings beyond what the particle stripper handled
         "어요", "아요", "에요", "예요", "습니다", "답니다", "지요", "네요",
         "대요", "아서", "어서", "으며", "으면", "하며", "려고", "려서",
+        # Casual sentence endings (often appear in parent posts)
+        "라구요", "더라구요", "거든요", "는걸요", "는데요", "답니당",
+        "입니당", "당", "거든", "는걸",
         # Adverb-forming endings ("빠르게/신나게/조용하게")
         "게",
         # Common adj-as-modifier endings ("즐거운/예쁜/사랑스러운")
@@ -683,6 +767,14 @@ class NotionMirror:
         "오늘은", "이렇게", "저렇게", "그렇게",
         "중에", "사이", "동안", "그동안", "이번엔", "다음엔",
         "정말로", "참으로", "마찬가지", "마치", "마침",
+        # Repetitive/temporal adverbs
+        "하루하루", "조금씩", "차차", "점점", "갈수록", "이따금",
+        # Common verb stems that survive ``는`` strip into 3-char form
+        "달라지", "변하", "자라", "커가", "성장하",
+        # Adjective-as-relative-clause ("싫은지/좋은지/어떤지")
+        "싫은지", "좋은지", "어떤지",
+        # Sound effects sometimes captured as 2-char tokens
+        "휙휙",
         # Passive/past participles that look like nouns but aren't:
         "펼쳐진", "늘어진", "이루어진", "쥐어진", "기울어진",
         # Common verb stems that survive particle strip
@@ -738,16 +830,125 @@ class NotionMirror:
 
     @classmethod
     def _summarize_text(cls, text: str, max_chars: int = 80) -> str:
-        """Pick a comma-joined list of meaningful Korean keywords from an
-        alimnota body.
+        """Title-line **keyword** extraction. kiwipiepy → heuristic fallback.
+        (Ollama is reserved for the longer-form summary callout — see
+        ``_summary_oneliner``.)
+        """
+        if not text:
+            return ""
+        kiwi = _get_kiwi()
+        if kiwi is not None:
+            return cls._summarize_text_kiwi(kiwi, text, max_chars)
+        return cls._summarize_text_heuristic(text, max_chars)
+
+    @classmethod
+    def _summary_oneliner(cls, text: str) -> str | None:
+        """One-sentence body summary using Ollama (LLM). Returns None when
+        no Ollama server is reachable (caller should just skip the summary
+        callout in that case).
+        """
+        if not text or len(text.strip()) < 20:
+            return None
+        cfg = _get_ollama()
+        if cfg is None:
+            return None
+        prompt = (
+            "다음 어린이집 알림장 본문을 한 문장(40자 이내)으로 요약해. "
+            "활동·식사·기분 등 중요한 내용만 자연스럽게. "
+            "다른 설명 없이 요약문만 한 줄로 답해.\n\n"
+            f"본문: {text[:1500]}\n\n요약:"
+        )
+        try:
+            r = requests.post(
+                f"{cfg['host']}/api/generate",
+                json={
+                    "model": cfg["model"],
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.3, "num_predict": 80},
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            out = (r.json().get("response") or "").strip()
+            if not out:
+                return None
+            # Drop anything after the first line / colon-style prefix.
+            first = out.split("\n")[0].strip().lstrip("- ").lstrip("* ")
+            # Guard against junk responses
+            if len(first) < 5 or len(first) > 200:
+                return None
+            return first
+        except Exception as e:
+            logging.getLogger(__name__).debug("ollama summary skipped: %s", e)
+            return None
+
+    @classmethod
+    def _summarize_text_kiwi(cls, kiwi: Any, text: str, max_chars: int) -> str:
+        """Kiwi-based keyword extraction: nouns only, frequency + length
+        weighted, substring-deduped."""
+        from collections import Counter
+        try:
+            result = kiwi.analyze(text)
+        except Exception:
+            return cls._summarize_text_heuristic(text, max_chars)
+        if not result:
+            return ""
+        tokens = result[0][0]
+        # NNG = common noun, NNP = proper noun (names, products, places)
+        nouns: list[str] = []
+        for tok in tokens:
+            tag = getattr(tok, "tag", "")
+            form = getattr(tok, "form", "")
+            if not form:
+                continue
+            if tag not in ("NNG", "NNP"):
+                continue
+            # Length: 2-6 chars (single Korean syllable nouns are rarely
+            # meaningful in this context; 7+ is usually compound junk)
+            if not (2 <= len(form) <= 6):
+                continue
+            # Skip generic stopwords (greetings, address terms, calendar,
+            # pronouns we explicitly don't want)
+            if form in cls._KEYWORD_STOPWORDS:
+                continue
+            nouns.append(form)
+
+        if not nouns:
+            return ""
+
+        counter = Counter(nouns)
+
+        def _score(word: str, freq: int) -> float:
+            n = len(word)
+            length_bonus = 1.0
+            if n >= 5:
+                length_bonus = 1.8
+            elif n == 4:
+                length_bonus = 1.5
+            elif n == 3:
+                length_bonus = 1.2
+            return freq * length_bonus
+
+        ranked = sorted(counter.keys(), key=lambda w: (-_score(w, counter[w]), w))
+        kept: list[str] = []
+        for w in ranked:
+            if any((w in k or k in w) for k in kept):
+                continue
+            kept.append(w)
+            if len(kept) >= 5:
+                break
+        return ", ".join(kept)[:max_chars]
+
+    @classmethod
+    def _summarize_text_heuristic(cls, text: str, max_chars: int = 80) -> str:
+        """Legacy fallback used when kiwipiepy isn't installed.
 
         Strategy (no LLM):
         1. Extract Korean letter runs from the body.
         2. Strip trailing particles (``을/를/이/가/에서/으로``).
         3. Drop greetings / filler / verbal endings (best-effort).
-        4. Prefer keywords that appear 2+ times; fall back to singletons
-           only when there aren't enough repeats.
-        5. Dedup substring overlaps and clip to 5 keywords.
+        4. Frequency + length weighted, substring dedup, top 5.
         """
         if not text:
             return ""
@@ -769,12 +970,27 @@ class NotionMirror:
             words.append(base)
 
         counter = Counter(words)
-        # Phase 1: repeats only (frequency >= 2) — these are the most
-        # signal-bearing keywords in an alimnota.
-        repeats = [w for w, c in counter.most_common(20) if c >= 2]
-        # Phase 2: top singletons as fallback when we don't have enough.
-        singletons = [w for w, c in counter.most_common(20) if c == 1]
-        ranked = repeats + singletons
+
+        # Score = frequency × length_bonus. Longer Korean tokens (4-5
+        # chars) are far more likely to be content nouns (카네이션,
+        # 머리띠, 돌잔치 etc) than the inflected 2-3 char forms (친한,
+        # 저번, 이제), so we tilt ranking toward them while still
+        # respecting repeats.
+        def _score(word: str, freq: int) -> float:
+            n = len(word)
+            length_bonus = 1.0
+            if n >= 5:
+                length_bonus = 1.8
+            elif n == 4:
+                length_bonus = 1.5
+            elif n == 3:
+                length_bonus = 1.2
+            return freq * length_bonus
+
+        ranked = sorted(
+            counter.keys(),
+            key=lambda w: (-_score(w, counter[w]), w),
+        )
 
         kept: list[str] = []
         for w in ranked:
@@ -1106,8 +1322,10 @@ class NotionMirror:
             "admin": "🏫",
         }.get(author_type, "📝")
 
-        # Weather: API field only. Empty → no weather in title or callout.
-        w_code = report.get("weather")
+        # Weather: API field only. Parent-written entries get the daycare's
+        # weather auto-attached by kidsnote (regardless of whether the
+        # parent saw it), which is misleading — strip it for parent posts.
+        w_code = report.get("weather") if author_type != "parent" else None
         w_emoji = ""
         if w_code:
             w_display = WEATHER_KO.get(w_code, "")
@@ -1127,14 +1345,26 @@ class NotionMirror:
             cname = report.get("child_name") or ""
             stripped = body_text
             if cname:
-                variants = {cname, cname + "이", cname + "이가",
-                            cname + "이는", cname + "이의"}
+                # Common Korean particle / suffix patterns that hang off a
+                # given name. Strip from the full ``cname`` and from the
+                # short (last 2 chars) form, since teachers/parents often
+                # use the short name (``하린이`` instead of ``우하린``).
+                particle_suffixes = (
+                    "이네용", "이네", "이가요", "이가",
+                    "이는요", "이는", "이의",
+                    "이도", "이만", "이를", "이에게",
+                    "이요", "이",
+                )
+                variants: set[str] = {cname}
+                for ps in particle_suffixes:
+                    variants.add(cname + ps)
                 if len(cname) >= 2:
                     short = cname[-2:]
-                    variants.update({short, short + "이",
-                                     short + "이가", short + "이는"})
-                # Apply longer variants first so we don't accidentally
-                # leave dangling "이"s.
+                    variants.add(short)
+                    for ps in particle_suffixes:
+                        variants.add(short + ps)
+                # Apply longer variants first so a leading shorter form
+                # doesn't gobble up part of a longer suffix.
                 for v in sorted(variants, key=len, reverse=True):
                     stripped = stripped.replace(v, "")
             summary = self._summarize_text(stripped)
