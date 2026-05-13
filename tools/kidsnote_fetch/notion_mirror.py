@@ -1700,4 +1700,215 @@ class NotionMirror:
         }
 
 
+    # ----------------------------------------------------------- stats dashboard
+
+    # Pinned report id used so the dashboard page lives inside the DB
+    # but never collides with a real kidsnote alimnota (positive 1e9 ids).
+    DASHBOARD_REPORT_ID = -1
+    DASHBOARD_TITLE = "📊 통계 대시보드"
+
+    def _find_dashboard_page(self) -> str | None:
+        """Locate the existing dashboard page by its sentinel Report ID."""
+        self._resolve_schema()
+        assert self._prop_report_id is not None
+        try:
+            r = self.session.post(
+                f"{NOTION_API}/databases/{self.database_id}/query",
+                headers=self._headers(),
+                json={
+                    "filter": {
+                        "property": self._prop_report_id,
+                        "number": {"equals": self.DASHBOARD_REPORT_ID},
+                    },
+                    "page_size": 1,
+                },
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            results = r.json().get("results") or []
+            return results[0]["id"] if results else None
+        except Exception as e:
+            _LOGGER.warning("dashboard lookup failed: %s", e)
+            return None
+
+    def _archive_page(self, page_id: str) -> None:
+        try:
+            self.session.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=self._headers(),
+                json={"archived": True},
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            _LOGGER.warning("page archive failed (%s): %s", page_id, e)
+
+    def publish_dashboard(self, stats: dict[str, Any]) -> dict[str, Any]:
+        """Replace (archive + recreate) the singleton stats dashboard page.
+
+        ``stats`` is a dict computed by the caller from the aggregated
+        reports/menus/notices/albums. See ``_build_dashboard_blocks`` for
+        the keys it consumes.
+        """
+        existing = self._find_dashboard_page()
+        if existing:
+            self._archive_page(existing)
+
+        blocks = self._build_dashboard_blocks(stats)
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        properties: dict[str, Any] = {
+            self._prop_title: {
+                "title": [{"text": {"content": self.DASHBOARD_TITLE}}],
+            },
+            self._prop_report_id: {"number": self.DASHBOARD_REPORT_ID},
+        }
+        if self._prop_date:
+            properties[self._prop_date] = {
+                "date": {"start": datetime.now().date().isoformat()},
+            }
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+            "children": blocks,
+        }
+        r = self.session.post(
+            f"{NOTION_API}/pages",
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def _mermaid_block(code: str) -> dict[str, Any]:
+        """Notion code block in mermaid language for inline charts."""
+        return {
+            "object": "block",
+            "type": "code",
+            "code": {
+                "language": "mermaid",
+                "rich_text": [{"type": "text", "text": {"content": code[:2000]}}],
+            },
+        }
+
+    @staticmethod
+    def _h2(text: str) -> dict[str, Any]:
+        return {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        }
+
+    def _build_dashboard_blocks(self, stats: dict[str, Any]) -> list[dict[str, Any]]:
+        """Assemble the dashboard page body from a pre-computed stats dict."""
+        blocks: list[dict[str, Any]] = []
+
+        # ---- header callout: total counts + last refreshed timestamp ----
+        last_refreshed = datetime.now().strftime("%Y-%m-%d %H:%M")
+        summary_lines = [
+            f"📨 알림장 {stats.get('reports_total', 0)}개  ·  "
+            f"📢 공지 {stats.get('notices_total', 0)}개  ·  "
+            f"📷 앨범 {stats.get('albums_total', 0)}개  ·  "
+            f"🍱 식단 {stats.get('menus_total', 0)}개",
+            f"마지막 갱신: {last_refreshed}",
+        ]
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": "\n".join(summary_lines)}}],
+                "icon": {"type": "emoji", "emoji": "📊"},
+                "color": "blue_background",
+            },
+        })
+
+        # ---- 카테고리 분포 (top 10 pie) ----
+        cat_counts = stats.get("category_counts") or {}
+        if cat_counts:
+            blocks.append(self._h2("🎨 카테고리 분포 (Top 10)"))
+            top = sorted(cat_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            mer = ["pie title 활동 카테고리"]
+            for label, n in top:
+                # Strip leading emoji for mermaid label, keep Korean only
+                safe = label.split(" ", 1)[-1] if " " in label else label
+                mer.append(f'  "{safe}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # ---- 월별 알림장 수 (table) ----
+        monthly = stats.get("monthly_report_counts") or {}
+        if monthly:
+            blocks.append(self._h2("📅 월별 알림장 수"))
+            ordered = sorted(monthly.items())
+            lines = ["| 월 | 알림장 수 |", "|---|---|"]
+            for m, n in ordered:
+                lines.append(f"| {m} | {n} |")
+            for line in lines:
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                })
+
+        # ---- 작성자 비율 (pie) ----
+        ac = stats.get("author_counts") or {}
+        if ac:
+            blocks.append(self._h2("✍️ 작성자 비율"))
+            mer = ["pie title 작성자"]
+            for atype, n in ac.items():
+                label = {"teacher": "선생님", "parent": "부모", "admin": "원감/원장"}.get(atype, atype)
+                mer.append(f'  "{label}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # ---- 평균 수면 시간 분포 ----
+        sh = stats.get("sleep_hour_dist") or {}
+        if sh:
+            blocks.append(self._h2("💤 낮잠 시간 분포"))
+            mer = ["pie title 낮잠 시간"]
+            for code, n in sh.items():
+                label = SLEEP_HOUR_KO.get(code, code)
+                mer.append(f'  "{label}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # ---- 식사 상태 분포 ----
+        ms = stats.get("meal_status_dist") or {}
+        if ms:
+            blocks.append(self._h2("🍽️ 식사 상태"))
+            mer = ["pie title 식사 상태"]
+            for code, n in ms.items():
+                label = STATUS_KO.get(code, code)
+                mer.append(f'  "{label}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # ---- 날씨 분포 ----
+        wd = stats.get("weather_dist") or {}
+        if wd:
+            blocks.append(self._h2("🌤️ 날씨 분포 (입력된 알림장만)"))
+            mer = ["pie title 날씨"]
+            for code, n in wd.items():
+                label = WEATHER_KO.get(code, code)
+                # mermaid pie labels can't include emojis cleanly — strip leading emoji
+                ko_only = label.split(" ", 1)[-1] if " " in label else label
+                mer.append(f'  "{ko_only}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # ---- 첨부물 통계 ----
+        att = stats.get("attachments") or {}
+        if att:
+            blocks.append(self._h2("📎 첨부물 누계"))
+            lines = [
+                f"📷 사진 {att.get('images', 0):,} 장",
+                f"🎬 동영상 {att.get('videos', 0):,} 개  (5MB 이상 skip {att.get('videos_skipped', 0)} 개)",
+                f"📄 첨부파일 {att.get('files', 0):,} 개  (5MB 이상 skip {att.get('files_skipped', 0)} 개)",
+            ]
+            for line in lines:
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                })
+
+        return blocks
+
+
 __all__ = ["NotionMirror", "DEFAULT_MAX_IMAGE_BYTES"]

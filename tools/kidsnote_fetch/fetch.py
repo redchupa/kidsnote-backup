@@ -559,6 +559,19 @@ def main(argv: list[str] | None = None) -> int:
     _LOGGER.info("fetched %d reports for child id=%s",
                  len(reports), target.get("id"))
 
+    # Enrich reports with detail API in one pass — both the publish step and
+    # the dashboard stats need fields that only the detail endpoint exposes
+    # (meal_status / sleep_hour / weather / food / sleep / nursing / bowel).
+    # 1 extra HTTP call per report, but skipping it would force two passes.
+    if mirror is not None and reports:
+        _LOGGER.info("enriching %d reports with detail API...", len(reports))
+        enriched: list[dict[str, Any]] = []
+        for r in reports:
+            d = _fetch_report_detail(sess, int(r["id"])) or r
+            enriched.append(d)
+        reports = enriched
+        _LOGGER.info("detail enrich done")
+
     # ---- local save (optional) -----
     total_new_files = 0
     if not args.no_local_save:
@@ -576,6 +589,9 @@ def main(argv: list[str] | None = None) -> int:
                 _LOGGER.debug("  %s  (+%d files)", folder.name, n_new)
         _LOGGER.info("local save: %d reports, %d new files under %s",
                      len(reports), total_new_files, args.backup_root)
+
+    # Accumulator for attachment counts (across all kinds).
+    publish_results: list[dict[str, Any]] = []
 
     # ---- helper: publish a batch of items via the given publish method ----
     def _publish_batch(
@@ -599,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             pct = (idx / total * 100) if total else 100.0
             try:
                 res = publish_fn(x, sess)
+                publish_results.append(res)
                 pub += 1
                 img_tot = res.get("images_uploaded", 0) + res.get("images_failed", 0)
                 parts = []
@@ -656,15 +673,15 @@ def main(argv: list[str] | None = None) -> int:
 
     matched_menu_ids: set[int] = set()
 
-    # ---- Notion mirror: alimnota reports -----
+    # ---- Notion mirror: alimnota reports (already enriched above) -----
+    notices: list[dict[str, Any]] = []
+    albums: list[dict[str, Any]] = []
     if mirror is not None:
-        def _publish_report_enriched(report: dict[str, Any], sess_: requests.Session) -> dict[str, Any]:
-            # 1) Enrich with detail fields (meal_status, sleep_hour, etc).
-            detail = _fetch_report_detail(sess_, int(report["id"])) or report
-            # 2) Same-day menu is only embedded into TEACHER posts (alimnota
-            #    from the daycare). Parent-written entries describe what the
-            #    family did at home, so attaching the daycare menu there is
-            #    nonsensical.
+        def _publish_report(detail: dict[str, Any], sess_: requests.Session) -> dict[str, Any]:
+            # Same-day menu is only embedded into TEACHER posts (alimnota
+            # from the daycare). Parent-written entries describe what the
+            # family did at home, so attaching the daycare menu there is
+            # nonsensical.
             author_type = (detail.get("author") or {}).get("type") or ""
             date_w = detail.get("date_written")
             attached_menu = None
@@ -674,7 +691,7 @@ def main(argv: list[str] | None = None) -> int:
                     matched_menu_ids.add(int(attached_menu["id"]))
             return mirror.publish_report(detail, sess_, attached_menu=attached_menu)
 
-        _publish_batch(reports, _publish_report_enriched, "Report")
+        _publish_batch(reports, _publish_report, "Report")
 
     # ---- Notion mirror: notices (center-wide) -----
     if mirror is not None and not args.no_notices and center_id:
@@ -706,6 +723,61 @@ def main(argv: list[str] | None = None) -> int:
             "Menu mirror: %d total fetched, %d inlined into reports, %d had no matching report (skipped)",
             len(menus_fetched), len(matched_menu_ids), len(menus_fetched) - len(matched_menu_ids),
         )
+
+    # ---- 📊 Stats dashboard ----
+    if mirror is not None and reports:
+        from collections import Counter
+        from notion_mirror import NotionMirror
+
+        cat_counter: Counter[str] = Counter()
+        monthly_counter: Counter[str] = Counter()
+        author_counter: Counter[str] = Counter()
+        sleep_counter: Counter[str] = Counter()
+        meal_counter: Counter[str] = Counter()
+        weather_counter: Counter[str] = Counter()
+
+        for r in reports:
+            for c in NotionMirror._classify_categories(r.get("content") or ""):
+                cat_counter[c] += 1
+            ym = (r.get("date_written") or "")[:7]
+            if ym:
+                monthly_counter[ym] += 1
+            atype = (r.get("author") or {}).get("type") or "unknown"
+            author_counter[atype] += 1
+            if r.get("sleep_hour"):
+                sleep_counter[r["sleep_hour"]] += 1
+            if r.get("meal_status"):
+                meal_counter[r["meal_status"]] += 1
+            if r.get("weather"):
+                weather_counter[r["weather"]] += 1
+
+        att = {
+            "images": sum(p.get("images_uploaded", 0) for p in publish_results),
+            "videos": sum(p.get("videos_uploaded", 0) for p in publish_results),
+            "videos_skipped": sum(p.get("videos_failed", 0) for p in publish_results),
+            "files": sum(p.get("files_uploaded", 0) for p in publish_results),
+            "files_skipped": sum(p.get("files_failed", 0) for p in publish_results),
+        }
+
+        stats = {
+            "reports_total": len(reports),
+            "notices_total": len(notices),
+            "albums_total": len(albums),
+            "menus_total": len(menus_fetched),
+            "category_counts": dict(cat_counter),
+            "monthly_report_counts": dict(monthly_counter),
+            "author_counts": dict(author_counter),
+            "sleep_hour_dist": dict(sleep_counter),
+            "meal_status_dist": dict(meal_counter),
+            "weather_dist": dict(weather_counter),
+            "attachments": att,
+        }
+        try:
+            mirror.publish_dashboard(stats)
+            _LOGGER.info("📊 Dashboard updated (reports=%d, categories=%d, months=%d)",
+                         len(reports), len(cat_counter), len(monthly_counter))
+        except Exception as e:
+            _LOGGER.warning("dashboard publish failed: %s", e)
 
     return 0
 
