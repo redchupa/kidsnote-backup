@@ -161,6 +161,10 @@ https://www.notion.so/내워크스페이스/238f5e29c0894adfb6c4d8e1a5b2c3d4?v=a
    - **Domain** 열이 **`.kidsnote.com`** (앞에 점 있음)
 7. 그 행의 **`Value`** 칸 클릭 → 표시되는 문자열을 더블클릭 → `Ctrl+C` 복사
 
+![Chrome F12 → Application → Cookies — sessionid 행](images/chrome-cookie-sessionid.png)
+
+> 위 스크린샷 하단에서 `sessionid` 행이 `.kidsnote.com` 도메인으로 보이는 게 정답.
+
 쿠키 값 예시: `ycen2ydnwm2vsoj3zxe618k5nugt7j66` (32자 정도, 영문 소문자+숫자)
 
 ⚠️ 메모장에 붙여두세요.
