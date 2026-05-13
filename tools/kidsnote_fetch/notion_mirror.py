@@ -916,12 +916,19 @@ class NotionMirror:
             for b in bowel:
                 if not isinstance(b, dict):
                     continue
-                line = json.dumps(b, ensure_ascii=False)
-                out.append({
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
-                })
+                t = b.get("time_bowel") or ""
+                status_raw = b.get("status") or ""
+                status_ko = STATUS_KO.get(status_raw, status_raw)
+                if t and status_ko:
+                    line = f"{t}  {status_ko}"
+                else:
+                    line = t or status_ko
+                if line:
+                    out.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
+                    })
 
         return out
 
