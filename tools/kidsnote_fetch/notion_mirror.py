@@ -115,8 +115,19 @@ STATUS_KO = {
     "calm": "차분",
 }
 WEATHER_KO = {
+    # Codes the live kidsnote API actually uses (sampled from 391 reports):
     "sunny": "☀️ 맑음",
     "partly_cloudy": "⛅ 구름 조금",
+    "mostly_cloudy": "🌥️ 구름 많음",
+    "overcast": "☁️ 흐림",
+    "fog": "🌫️ 안개",
+    "rain": "🌧️ 비",
+    "sunny_after_rain": "🌈 비온 뒤 맑음",
+    "snow": "❄️ 눈",
+    "yellow_sand": "🟡 황사",
+    "thunderstorm": "⛈️ 천둥번개",
+    "mixed_rain_snow": "🌨️ 진눈깨비",
+    # Fallbacks for variants that may show up at other daycares:
     "cloudy": "☁️ 흐림",
     "rainy": "🌧️ 비",
     "snowy": "❄️ 눈",
