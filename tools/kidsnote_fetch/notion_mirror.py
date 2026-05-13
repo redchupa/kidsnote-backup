@@ -118,40 +118,6 @@ STATUS_KO = {
     "active": "활발",
     "calm": "차분",
 }
-# When the kidsnote ``weather`` field is empty (daycare didn't fill it in),
-# we scan the body text for these phrases and infer a weather emoji. Order
-# matters — more specific phrases come first so ``눈사람`` (snow) wins over
-# generic ``눈`` (eye/snow). The inferred value is rendered as a localized
-# WEATHER_KO display only — the original API value is untouched.
-WEATHER_INFER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("mixed_rain_snow", ("진눈깨비",)),
-    ("thunderstorm",    ("천둥", "번개", "뇌우")),
-    ("sunny_after_rain", ("비가 그치", "비 그치", "무지개", "비가 멎")),
-    ("rain",            # Specific verb forms so 나비/티비/준비 don't fire:
-                        ("비가 오", "비가 와", "비가 내", "비가 올",
-                         "비가 그치지 않", "비를 맞", "비를 흠뻑",
-                         "비도 오", "비도 내",
-                         # Distinct rain-type nouns:
-                         "장마", "장맛비", "소나기", "빗속", "빗방울",
-                         "보슬비", "봄비", "여우비", "가랑비", "이슬비",
-                         "물비", "비바람")),
-    ("snow",            ("눈이 와", "눈이 내", "눈사람", "함박눈",
-                         "폭설", "첫눈", "눈을 맞", "눈 내려",
-                         "눈송이", "눈꽃")),
-    ("fog",             ("안개", "안갯속")),
-    ("yellow_sand",     ("황사", "미세먼지", "초미세먼지")),
-    ("hot",             ("폭염", "땡볕", "푹푹", "더워서", "더운 날",
-                         "찜통", "열대야", "한여름")),
-    ("cold",            ("한파", "강추위", "꽁꽁 얼", "엄청 추",
-                         "영하", "한풍", "칼바람")),
-    ("mostly_cloudy",   ("잔뜩 흐", "온통 흐", "구름 많")),
-    ("partly_cloudy",   ("구름이 조금", "약간 흐", "구름이 가끔")),
-    ("overcast",        ("흐림", "흐려", "흐린 날", "잔뜩 흐려")),
-    ("sunny",           ("화창", "맑은 날", "맑게", "햇살이", "햇빛이",
-                         "햇볕이", "쨍쨍", "포근한", "따스한", "햇님")),
-)
-
-
 WEATHER_KO = {
     # Codes the live kidsnote API actually uses (sampled from 391 reports):
     "sunny": "☀️ 맑음",
@@ -561,23 +527,18 @@ class NotionMirror:
         if meta_bits:
             blocks.append(self._para(" · ".join(meta_bits), color="gray"))
 
-        # Weather callout — prefer API field, fall back to text inference
-        # (daycare often skipped the weather selector since 2026-03).
+        # Weather callout — only when the daycare actually filled in the
+        # weather field. No body-text inference (per design: ``있는 그대로``).
         w_code = report.get("weather")
-        w_inferred = False
-        if not w_code:
-            w_code = self._infer_weather_from_text(report.get("content") or "")
-            w_inferred = bool(w_code)
         if w_code:
             w_display = WEATHER_KO.get(w_code, w_code)
-            suffix = " (본문 추정)" if w_inferred else ""
             blocks.append({
                 "object": "block",
                 "type": "callout",
                 "callout": {
                     "rich_text": [{
                         "type": "text",
-                        "text": {"content": f"오늘의 날씨: {w_display}{suffix}"},
+                        "text": {"content": f"오늘의 날씨: {w_display}"},
                     }],
                     "icon": {"type": "emoji", "emoji": "🌤️"},
                     "color": "blue_background",
@@ -756,38 +717,6 @@ class NotionMirror:
                 pat = re.compile(rf"(?<![가-힣]){re.escape(kw)}")
                 patterns.append(pat)
             cls._CATEGORY_PATTERNS.append((label, patterns))
-
-    _WEATHER_PATTERNS_COMPILED: list[tuple[str, list]] | None = None
-
-    @classmethod
-    def _ensure_weather_patterns(cls) -> None:
-        if cls._WEATHER_PATTERNS_COMPILED is not None:
-            return
-        cls._WEATHER_PATTERNS_COMPILED = []
-        for code, phrases in WEATHER_INFER_PATTERNS:
-            # Word-boundary aware: keyword must NOT be a tail of another
-            # Korean word. Without this, ``비가 `` fires inside ``나비가``,
-            # ``비를 `` fires inside ``티비를``, etc.
-            compiled = [
-                re.compile(rf"(?<![가-힣]){re.escape(ph)}") for ph in phrases
-            ]
-            cls._WEATHER_PATTERNS_COMPILED.append((code, compiled))
-
-    @classmethod
-    def _infer_weather_from_text(cls, text: str) -> str | None:
-        """Scan an alimnota body for weather phrases when the API
-        ``weather`` field is empty. Returns the WEATHER_KO key (e.g.
-        ``sunny``, ``rain``) of the first matching phrase, or None.
-        Word-boundary aware so ``나비가`` doesn't trigger 🌧️.
-        """
-        if not text:
-            return None
-        cls._ensure_weather_patterns()
-        for code, patterns in cls._WEATHER_PATTERNS_COMPILED or []:
-            for pat in patterns:
-                if pat.search(text):
-                    return code
-        return None
 
     @classmethod
     def _classify_categories(cls, text: str, max_n: int = 3) -> list[str]:
@@ -1177,13 +1106,8 @@ class NotionMirror:
             "admin": "🏫",
         }.get(author_type, "📝")
 
-        # Weather: prefer the API field; if blank, infer from body text
-        # (parent posts + recent teacher posts often have no weather code).
+        # Weather: API field only. Empty → no weather in title or callout.
         w_code = report.get("weather")
-        w_inferred = False
-        if not w_code:
-            w_code = self._infer_weather_from_text(report.get("content") or "")
-            w_inferred = bool(w_code)
         w_emoji = ""
         if w_code:
             w_display = WEATHER_KO.get(w_code, "")
