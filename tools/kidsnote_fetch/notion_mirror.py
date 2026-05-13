@@ -112,6 +112,18 @@ STATUS_KO = {
     "active": "활발",
     "calm": "차분",
 }
+WEATHER_KO = {
+    "sunny": "☀️ 맑음",
+    "partly_cloudy": "⛅ 구름 조금",
+    "cloudy": "☁️ 흐림",
+    "rainy": "🌧️ 비",
+    "snowy": "❄️ 눈",
+    "foggy": "🌫️ 안개",
+    "windy": "💨 바람",
+    "stormy": "⛈️ 폭풍",
+    "hot": "🥵 더움",
+    "cold": "🥶 추움",
+}
 
 # The target database's actual property names are discovered at runtime via
 # `GET /v1/databases/{id}`. This lets the Notion Korean UI's auto-translated
@@ -445,7 +457,8 @@ class NotionMirror:
         if report.get("class_name"):
             meta_bits.append(f"{report['class_name']}")
         if report.get("weather"):
-            meta_bits.append(f"날씨 {report['weather']}")
+            w = report['weather']
+            meta_bits.append(f"날씨 {WEATHER_KO.get(w, w)}")
         if report.get("date_written"):
             meta_bits.append(f"작성 {report['date_written']}")
         if meta_bits:
