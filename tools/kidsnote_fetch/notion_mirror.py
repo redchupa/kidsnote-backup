@@ -127,6 +127,38 @@ WEATHER_KO = {
     "cold": "🥶 추움",
 }
 
+# Activity categories used to label alimnota titles.
+# Order matters — earlier entries get matched first when multiple categories
+# fit. Each tuple is the list of body keywords that activates the label.
+ACTIVITY_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("🎨 미술",     ("색연필", "그림", "점토", "물감", "크레파스", "만들기",
+                     "찰흙", "색종이", "도화지", "스티커", "꾸미기", "오리기",
+                     "붙이기", "색칠", "그리기")),
+    ("🎵 음악",     ("노래", "동요", "악기", "율동", "리듬", "탬버린",
+                     "트라이앵글", "마라카스", "춤추")),
+    ("📚 책읽기",   ("책", "동화", "독서", "그림책", "이야기책")),
+    ("🚶 산책",     ("산책", "공원", "나들이", "외출", "바깥놀이", "야외놀이")),
+    ("🌳 자연",     ("나뭇잎", "나무", "꽃잎", "벌레", "곤충", "햇살",
+                     "흙", "모래", "동물원", "관찰")),
+    ("🌸 꽃",       ("꽃", "꽃밭")),
+    ("🍱 식사",     ("도시락", "점심", "급식", "반찬", "냠냠", "맛있게",
+                     "식사", "식단")),
+    ("🍪 간식",     ("간식", "과자", "우유", "빵", "과일", "치즈")),
+    ("💤 낮잠",     ("낮잠", "수면", "잠을 잤", "꿈나라")),
+    ("🧩 블록",     ("블록", "퍼즐", "쌓기", "레고", "구성놀이")),
+    ("🚗 역할놀이", ("역할놀이", "소꿉", "병원놀이", "마트놀이",
+                     "엄마놀이", "아빠놀이", "선생님놀이")),
+    ("💧 물놀이",   ("물놀이", "수영", "분수")),
+    ("🏃 신체활동", ("체조", "운동", "달리기", "뛰기", "체육", "신체놀이",
+                     "공놀이", "킥보드", "자전거")),
+    ("📅 행사",     ("생일", "졸업", "입학", "운동회", "발표회", "재롱",
+                     "공연", "현장학습", "소풍")),
+    ("💉 건강",     ("병원", "체온", "감기", "약을", "안전교육", "소방",
+                     "지진훈련")),
+    ("🏠 가정활동", ("할머니", "할아버지", "외할머니", "외할아버지",
+                     "친정", "본가", "집에서")),
+)
+
 # The target database's actual property names are discovered at runtime via
 # `GET /v1/databases/{id}`. This lets the Notion Korean UI's auto-translated
 # defaults ("이름", "날짜") and user-chosen variants ("리포트 ID") work
@@ -465,13 +497,30 @@ class NotionMirror:
             meta_bits.append(f"{role_label} {aname}")
         if report.get("class_name"):
             meta_bits.append(f"{report['class_name']}")
-        if report.get("weather"):
-            w = report['weather']
-            meta_bits.append(f"날씨 {WEATHER_KO.get(w, w)}")
         if report.get("date_written"):
             meta_bits.append(f"작성 {report['date_written']}")
         if meta_bits:
             blocks.append(self._para(" · ".join(meta_bits), color="gray"))
+
+        # Weather is rendered as its own callout block — easier to spot than
+        # buried inside the meta line, and only appears when the daycare
+        # actually entered the field (older entries usually have it; new
+        # ones often have ``weather=''``).
+        w_code = report.get("weather")
+        if w_code:
+            w_display = WEATHER_KO.get(w_code, w_code)
+            blocks.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {"content": f"오늘의 날씨: {w_display}"},
+                    }],
+                    "icon": {"type": "emoji", "emoji": "🌤️"},
+                    "color": "blue_background",
+                },
+            })
 
         # Body content
         body = (report.get("content") or "").strip()
@@ -564,11 +613,14 @@ class NotionMirror:
 
     @classmethod
     def _strip_particle(cls, word: str) -> str:
+        # 2-char particles: word must keep at least 1 char after strip.
         for p in cls._PARTICLE_2:
-            if word.endswith(p) and len(word) > len(p) + 1:
+            if word.endswith(p) and len(word) > len(p):
                 return word[: -len(p)]
+        # 1-char particles: word must keep at least 1 char after strip
+        # (so ``꽃도`` → ``꽃``).
         for p in cls._PARTICLE_1:
-            if word.endswith(p) and len(word) > 2:
+            if word.endswith(p) and len(word) > 1:
                 return word[:-1]
         return word
 
@@ -577,24 +629,89 @@ class NotionMirror:
     _VERB_ADJ_TAILS = (
         # Connective endings
         "고", "서", "며", "면", "도록", "면서", "지만", "아도", "어도", "려고",
+        "더니", "더라", "다가", "으니", "으면", "라서", "라며", "는데",
+        "자마자", "더라도", "을수록", "을지", "은채", "은채로", "다면",
         # Past-tense stems
         "았", "었", "였", "겠", "했", "봤", "갔", "왔", "됐", "었던", "았던",
         # Final endings beyond what the particle stripper handled
         "어요", "아요", "에요", "예요", "습니다", "답니다", "지요", "네요",
         "대요", "아서", "어서", "으며", "으면", "하며", "려고", "려서",
+        # Adverb-forming endings ("빠르게/신나게/조용하게")
+        "게",
         # Common adj-as-modifier endings ("즐거운/예쁜/사랑스러운")
-        "스러운", "다운", "러운", "ろ운",
+        "스러운", "다운", "러운",
+        # 1-char verb/adj inflection endings — keep only the ones that
+        # never legitimately end a Korean noun in alimnota text. ``진/킨/긴/된``
+        # were dropped because they would block real nouns like ``사진``.
+        # Specific passive forms (펼쳐진/늘어진/이루어진) are added as
+        # multi-char stopwords below instead.
+        "여", "워", "는", "은", "운",
     )
 
     # Adjective/verb stems we still want to drop when they slip through
-    # the verbal-ending filter (e.g. ``예쁜`` is only 2 chars).
+    # the verbal-ending filter (e.g. ``예쁜`` is only 2 chars). This list
+    # grows over time as user feedback identifies more noise.
     _EXTRA_STOPWORDS = frozenset({
-        "즐거운", "예쁜", "신나는", "사랑", "사랑스러운", "기특", "행복", "활발",
+        "즐거운", "예쁜", "신나는", "신나게", "사랑", "사랑스러운", "기특", "행복", "활발",
+        "가득", "가득한", "표정", "기어", "기특한", "다정한", "조용한", "씩씩한",
         "보더니", "보고", "보며", "보았", "가서", "가고", "왔어", "갔어",
         "주는", "주었", "주신", "받았", "되었", "있어", "없어", "해서", "하며",
         "되어", "하고", "되는", "되어서", "있는", "없는", "있어요",
         "오늘은", "이렇게", "저렇게", "그렇게",
+        "중에", "사이", "동안", "그동안", "이번엔", "다음엔",
+        "정말로", "참으로", "마찬가지", "마치", "마침",
+        # Passive/past participles that look like nouns but aren't:
+        "펼쳐진", "늘어진", "이루어진", "쥐어진", "기울어진",
+        # Common verb stems that survive particle strip
+        "했지", "되었지", "보았지", "갔지",
     })
+
+    # 1-character keyword stopwords (filler / adverbs / determiners that
+    # would otherwise survive the particle-strip stage when a 2-char
+    # word like ``잘은`` → ``잘`` slips through).
+    _ONECHAR_STOPWORDS = frozenset({
+        "잘", "안", "또", "더", "꼭", "참", "그", "이", "저", "거", "것",
+        "수", "들", "수", "곳", "데", "쪽", "분", "내", "네", "왜", "뭐",
+        "다", "한", "두", "세", "넷", "막", "쭉", "푹", "쏙",
+    })
+
+    # Cache compiled patterns: each keyword turns into a Korean word-boundary
+    # pattern so ``책`` does NOT match inside ``산책``.
+    _CATEGORY_PATTERNS: list[tuple[str, list]] | None = None
+
+    @classmethod
+    def _ensure_category_patterns(cls) -> None:
+        if cls._CATEGORY_PATTERNS is not None:
+            return
+        cls._CATEGORY_PATTERNS = []
+        for label, keywords in ACTIVITY_CATEGORIES:
+            patterns = []
+            for kw in keywords:
+                # Word-start boundary only: keyword must NOT be a tail of
+                # another Korean word (so ``책`` doesn't fire inside ``산책``).
+                # No constraint on what follows so attached particles like
+                # ``을/를/도/이/가`` still let the keyword match.
+                pat = re.compile(rf"(?<![가-힣]){re.escape(kw)}")
+                patterns.append(pat)
+            cls._CATEGORY_PATTERNS.append((label, patterns))
+
+    @classmethod
+    def _classify_categories(cls, text: str, max_n: int = 3) -> list[str]:
+        """Match the body against ACTIVITY_CATEGORIES, return up to ``max_n``
+        labels. Word-boundary aware so ``책`` won't match inside ``산책``.
+        """
+        if not text:
+            return []
+        cls._ensure_category_patterns()
+        matched: list[str] = []
+        for label, patterns in cls._CATEGORY_PATTERNS or []:
+            for pat in patterns:
+                if pat.search(text):
+                    matched.append(label)
+                    break
+            if len(matched) >= max_n:
+                break
+        return matched
 
     @classmethod
     def _summarize_text(cls, text: str, max_chars: int = 80) -> str:
@@ -617,6 +734,9 @@ class NotionMirror:
         for w in raw_words:
             base = cls._strip_particle(w)
             n = len(base)
+            # 1-char tokens are nearly always verb stems or particles
+            # leftover; the few legit ones (꽃/물/밥) aren't worth the
+            # noise, so we hard-drop them entirely.
             if not (2 <= n <= 5):
                 continue
             if base in cls._KEYWORD_STOPWORDS or base in cls._EXTRA_STOPWORDS:
@@ -946,25 +1066,31 @@ class NotionMirror:
             or (report.get("created") or "")[:10]
             or datetime.now().date().isoformat()
         )
-        # Title: prefix with author-role emoji so a daycare entry vs a
-        # parent entry is distinguishable at a glance in the DB list view.
+        # Title: prefix with author-role emoji + activity category labels.
+        # Categories are matched against a curated keyword dictionary
+        # (ACTIVITY_CATEGORIES). When no category matches, fall back to
+        # the heuristic keyword extractor; if even that's empty, use the
+        # generic ``알림장 #ID`` form.
         author_type = (report.get("author") or {}).get("type") or ""
         author_icon = {
             "teacher": "👩‍🏫",
             "parent": "👨‍👩‍👧",
             "admin": "🏫",
         }.get(author_type, "📝")
-        # Strip child name from body before keyword extraction — otherwise
-        # every report's top keyword is just the child's name.
-        body_for_summary = report.get("content") or ""
-        cname = report.get("child_name") or ""
-        if cname and body_for_summary:
-            body_for_summary = body_for_summary.replace(cname, "")
-        summary = self._summarize_text(body_for_summary)
-        if summary:
-            title = f"[{date_str}] {author_icon} {summary}"
+        body_text = report.get("content") or ""
+        categories = self._classify_categories(body_text)
+        if categories:
+            label = " · ".join(categories)
+            title = f"[{date_str}] {author_icon} {label}"
         else:
-            title = f"[{date_str}] {author_icon} 알림장 #{report_id}"
+            # Fallback to keyword summary, then to a fixed label.
+            cname = report.get("child_name") or ""
+            stripped = body_text.replace(cname, "") if cname else body_text
+            summary = self._summarize_text(stripped)
+            if summary:
+                title = f"[{date_str}] {author_icon} {summary}"
+            else:
+                title = f"[{date_str}] {author_icon} 알림장 #{report_id}"
 
         # Upload photos first so we can drop image blocks into the page body.
         image_upload_ids: list[str] = []
