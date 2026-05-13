@@ -452,10 +452,17 @@ class NotionMirror:
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
-        # Metadata header (gray, single line)
+        # Metadata header (gray, single line) — author role depends on author.type
         meta_bits: list[str] = []
-        if report.get("author_name"):
-            meta_bits.append(f"선생님 {report['author_name']}")
+        atype = (report.get("author") or {}).get("type") or ""
+        aname = report.get("author_name") or (report.get("author") or {}).get("name") or ""
+        if aname:
+            role_label = {
+                "teacher": "👩‍🏫 선생님",
+                "parent": "👨‍👩‍👧 부모",
+                "admin": "🏫 원감",
+            }.get(atype, "✏️ 작성자")
+            meta_bits.append(f"{role_label} {aname}")
         if report.get("class_name"):
             meta_bits.append(f"{report['class_name']}")
         if report.get("weather"):
@@ -528,49 +535,114 @@ class NotionMirror:
 
     # ----------------------------------------------------------- publish
 
-    # Common Korean greeting prefixes that drown out the real content of an
-    # alimnota when used naïvely as the page title. The script strips a
-    # leading greeting *sentence* — not just the word — so the next sentence
-    # (which usually contains the day's actual activity) becomes the title.
-    _GREETING_PATTERNS = (
-        re.compile(r"^안녕하세[요시는유]+[^.!?~♡^]*[.!?~♡^]+\s*"),
-        re.compile(r"^어머[니님][^.!?~♡^]*[.!?~♡^]+\s*"),
-        re.compile(r"^아버[지님][^.!?~♡^]*[.!?~♡^]+\s*"),
-        re.compile(r"^부모[님]?[^.!?~♡^]*[.!?~♡^]+\s*"),
-    )
+    # Stopwords for the keyword-based title extractor. Anything filler /
+    # generic / verbal-ending gets dropped so the leftover keywords are
+    # the day's actual activity nouns (점토, 색연필, 도시락 etc).
+    _KEYWORD_STOPWORDS = frozenset({
+        # Greetings + address terms
+        "안녕하세요", "어머님", "어머니", "아버님", "아버지", "부모님", "부모",
+        # Calendar
+        "오늘", "어제", "내일", "하루", "이번", "다음", "주말", "평일", "낮", "밤",
+        # Generic people
+        "선생님", "친구", "친구들", "아이", "아기", "동생", "형", "누나", "엄마", "아빠",
+        # Filler / pronouns / adverbs
+        "우리", "너무", "정말", "그래서", "그리고", "함께", "같이", "다같이",
+        "이렇게", "저렇게", "그렇게", "이런", "저런", "그런", "약간", "많이", "조금",
+        "처음", "다시", "또한", "역시", "참고",
+        # Common verb stems left after particle strip
+        "있어", "없어", "되어", "되었", "했어", "했었", "했답", "있었",
+        "있는", "없는", "되는", "하는", "보고", "보며", "보이", "보았",
+    })
+
+    # Korean josa (particles) we strip from the tail of each word before
+    # frequency counting. Two-char particles are tried first.
+    _PARTICLE_2 = ("으로", "에서", "에게", "한테", "처럼", "보다", "마다",
+                   "까지", "부터", "이라", "라고", "이고", "이며", "이지",
+                   "에는", "에도", "에만", "은데", "는데")
+    _PARTICLE_1 = ("을", "를", "이", "가", "은", "는", "도", "만",
+                   "의", "에", "와", "과", "로", "랑", "야", "여", "께")
 
     @classmethod
-    def _summarize_text(cls, text: str, max_chars: int = 100) -> str:
-        """Pick a readable one-line summary out of an alimnota body.
+    def _strip_particle(cls, word: str) -> str:
+        for p in cls._PARTICLE_2:
+            if word.endswith(p) and len(word) > len(p) + 1:
+                return word[: -len(p)]
+        for p in cls._PARTICLE_1:
+            if word.endswith(p) and len(word) > 2:
+                return word[:-1]
+        return word
 
-        Strategy:
-        1. Strip leading greeting sentence (``안녕하세요 어머님~`` etc) so the
-           summary lands on the meaningful first sentence about the day.
-        2. Collapse internal whitespace.
-        3. Cut at the first sentence terminator (Korean ``다./요.`` and Latin).
-        4. Hard-truncate at ``max_chars`` + ellipsis when no sentence end
-           lies within that range.
+    # Verb / adjective tails we filter out (these come AFTER particle-strip
+    # so the remaining base form still has the verb/adj inflection).
+    _VERB_ADJ_TAILS = (
+        # Connective endings
+        "고", "서", "며", "면", "도록", "면서", "지만", "아도", "어도", "려고",
+        # Past-tense stems
+        "았", "었", "였", "겠", "했", "봤", "갔", "왔", "됐", "었던", "았던",
+        # Final endings beyond what the particle stripper handled
+        "어요", "아요", "에요", "예요", "습니다", "답니다", "지요", "네요",
+        "대요", "아서", "어서", "으며", "으면", "하며", "려고", "려서",
+        # Common adj-as-modifier endings ("즐거운/예쁜/사랑스러운")
+        "스러운", "다운", "러운", "ろ운",
+    )
+
+    # Adjective/verb stems we still want to drop when they slip through
+    # the verbal-ending filter (e.g. ``예쁜`` is only 2 chars).
+    _EXTRA_STOPWORDS = frozenset({
+        "즐거운", "예쁜", "신나는", "사랑", "사랑스러운", "기특", "행복", "활발",
+        "보더니", "보고", "보며", "보았", "가서", "가고", "왔어", "갔어",
+        "주는", "주었", "주신", "받았", "되었", "있어", "없어", "해서", "하며",
+        "되어", "하고", "되는", "되어서", "있는", "없는", "있어요",
+        "오늘은", "이렇게", "저렇게", "그렇게",
+    })
+
+    @classmethod
+    def _summarize_text(cls, text: str, max_chars: int = 80) -> str:
+        """Pick a comma-joined list of meaningful Korean keywords from an
+        alimnota body.
+
+        Strategy (no LLM):
+        1. Extract Korean letter runs from the body.
+        2. Strip trailing particles (``을/를/이/가/에서/으로``).
+        3. Drop greetings / filler / verbal endings (best-effort).
+        4. Prefer keywords that appear 2+ times; fall back to singletons
+           only when there aren't enough repeats.
+        5. Dedup substring overlaps and clip to 5 keywords.
         """
         if not text:
             return ""
-        flat = " ".join(text.split())
-        # Strip up to 2 greeting sentences in a row ("안녕하세요. 어머니~").
-        for _ in range(2):
-            for pat in cls._GREETING_PATTERNS:
-                m = pat.match(flat)
-                if m:
-                    flat = flat[m.end():].lstrip()
-                    break
-            else:
+        from collections import Counter
+        raw_words = re.findall(r"[가-힣]+", text)
+        words: list[str] = []
+        for w in raw_words:
+            base = cls._strip_particle(w)
+            n = len(base)
+            if not (2 <= n <= 5):
+                continue
+            if base in cls._KEYWORD_STOPWORDS or base in cls._EXTRA_STOPWORDS:
+                continue
+            if any(base.endswith(t) for t in cls._VERB_ADJ_TAILS):
+                continue
+            words.append(base)
+
+        counter = Counter(words)
+        # Phase 1: repeats only (frequency >= 2) — these are the most
+        # signal-bearing keywords in an alimnota.
+        repeats = [w for w, c in counter.most_common(20) if c >= 2]
+        # Phase 2: top singletons as fallback when we don't have enough.
+        singletons = [w for w, c in counter.most_common(20) if c == 1]
+        ranked = repeats + singletons
+
+        kept: list[str] = []
+        for w in ranked:
+            if any((w in k or k in w) for k in kept):
+                continue
+            kept.append(w)
+            if len(kept) >= 5:
                 break
 
-        for delim in ("다. ", "요. ", "다.", "요.", ".", "!", "?", "♡"):
-            idx = flat.find(delim)
-            if 10 < idx < max_chars:
-                return flat[: idx + len(delim)].rstrip()
-        if len(flat) > max_chars:
-            return flat[:max_chars].rstrip() + "..."
-        return flat
+        out = ", ".join(kept)
+        return out[:max_chars]
 
     @staticmethod
     def _life_record_bits(report: dict[str, Any]) -> list[str]:
@@ -874,8 +946,25 @@ class NotionMirror:
             or (report.get("created") or "")[:10]
             or datetime.now().date().isoformat()
         )
-        summary = self._summarize_text(report.get("content") or "")
-        title = f"[{date_str}] {summary}" if summary else f"[{date_str}] 알림장 #{report_id}"
+        # Title: prefix with author-role emoji so a daycare entry vs a
+        # parent entry is distinguishable at a glance in the DB list view.
+        author_type = (report.get("author") or {}).get("type") or ""
+        author_icon = {
+            "teacher": "👩‍🏫",
+            "parent": "👨‍👩‍👧",
+            "admin": "🏫",
+        }.get(author_type, "📝")
+        # Strip child name from body before keyword extraction — otherwise
+        # every report's top keyword is just the child's name.
+        body_for_summary = report.get("content") or ""
+        cname = report.get("child_name") or ""
+        if cname and body_for_summary:
+            body_for_summary = body_for_summary.replace(cname, "")
+        summary = self._summarize_text(body_for_summary)
+        if summary:
+            title = f"[{date_str}] {author_icon} {summary}"
+        else:
+            title = f"[{date_str}] {author_icon} 알림장 #{report_id}"
 
         # Upload photos first so we can drop image blocks into the page body.
         image_upload_ids: list[str] = []
