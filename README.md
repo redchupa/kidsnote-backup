@@ -165,7 +165,7 @@ https://www.notion.so/내워크스페이스/238f5e29c0894adfb6c4d8e1a5b2c3d4?v=a
 
 > 위 스크린샷 하단에서 `sessionid` 행이 `.kidsnote.com` 도메인으로 보이는 게 정답.
 
-쿠키 값 예시: `ycen2ydnwm2vsoj3zxe618k5nugt7j66` (32자 정도, 영문 소문자+숫자)
+쿠키 값 예시: `ycen2ydnwm2vsoj3zxe618k5nugt7j33` (32자 정도, 영문 소문자+숫자)
 
 ⚠️ 메모장에 붙여두세요.
 
