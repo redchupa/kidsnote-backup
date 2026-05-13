@@ -89,7 +89,9 @@ MAX_BLOCK_TEXT = 1900                 # Notion paragraph rich_text limit (2000).
 # Kidsnote life-record status codes → human Korean. Unknown values are
 # rendered as-is, so missing entries here just degrade gracefully.
 SLEEP_HOUR_KO = {
+    "no_sleep": "안 잤음",
     "none": "안 잠",
+    "below_1": "1시간 미만",
     "under_30m": "30분 이내",
     "30m_to_1": "30분~1시간",
     "1_to_1.5": "1~1.5시간",
@@ -107,6 +109,8 @@ STATUS_KO = {
     "hard": "딱딱",
     "none": "없음",
     "fixed": "정해진 식단",
+    "more": "많이 먹음",
+    "less": "적게 먹음",
     "sick": "아픔",
     "fine": "양호",
     "trimmed": "정리됨",
@@ -122,17 +126,24 @@ STATUS_KO = {
 WEATHER_INFER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("mixed_rain_snow", ("진눈깨비",)),
     ("thunderstorm",    ("천둥", "번개", "뇌우")),
-    ("sunny_after_rain", ("비온 뒤", "비가 그치", "비 그치고")),
-    ("rain",            ("비가 ", "비를 ", "비도 ", "비 와", "비온",
-                         "장마", "소나기", "빗속", "빗방울", "보슬비")),
+    ("sunny_after_rain", ("비가 그치", "비 그치", "무지개", "비가 멎")),
+    ("rain",            # Specific verb forms so 나비/티비/준비 don't fire:
+                        ("비가 오", "비가 와", "비가 내", "비가 올",
+                         "비가 그치지 않", "비를 맞", "비를 흠뻑",
+                         "비도 오", "비도 내",
+                         # Distinct rain-type nouns:
+                         "장마", "장맛비", "소나기", "빗속", "빗방울",
+                         "보슬비", "봄비", "여우비", "가랑비", "이슬비",
+                         "물비", "비바람")),
     ("snow",            ("눈이 와", "눈이 내", "눈사람", "함박눈",
-                         "폭설", "첫눈", "눈을 맞", "눈 내려")),
+                         "폭설", "첫눈", "눈을 맞", "눈 내려",
+                         "눈송이", "눈꽃")),
     ("fog",             ("안개", "안갯속")),
     ("yellow_sand",     ("황사", "미세먼지", "초미세먼지")),
     ("hot",             ("폭염", "땡볕", "푹푹", "더워서", "더운 날",
-                         "땀이 비", "찜통", "열대야")),
+                         "찜통", "열대야", "한여름")),
     ("cold",            ("한파", "강추위", "꽁꽁 얼", "엄청 추",
-                         "영하", "한풍")),
+                         "영하", "한풍", "칼바람")),
     ("mostly_cloudy",   ("잔뜩 흐", "온통 흐", "구름 많")),
     ("partly_cloudy",   ("구름이 조금", "약간 흐", "구름이 가끔")),
     ("overcast",        ("흐림", "흐려", "흐린 날", "잔뜩 흐려")),
@@ -746,17 +757,35 @@ class NotionMirror:
                 patterns.append(pat)
             cls._CATEGORY_PATTERNS.append((label, patterns))
 
-    @staticmethod
-    def _infer_weather_from_text(text: str) -> str | None:
+    _WEATHER_PATTERNS_COMPILED: list[tuple[str, list]] | None = None
+
+    @classmethod
+    def _ensure_weather_patterns(cls) -> None:
+        if cls._WEATHER_PATTERNS_COMPILED is not None:
+            return
+        cls._WEATHER_PATTERNS_COMPILED = []
+        for code, phrases in WEATHER_INFER_PATTERNS:
+            # Word-boundary aware: keyword must NOT be a tail of another
+            # Korean word. Without this, ``비가 `` fires inside ``나비가``,
+            # ``비를 `` fires inside ``티비를``, etc.
+            compiled = [
+                re.compile(rf"(?<![가-힣]){re.escape(ph)}") for ph in phrases
+            ]
+            cls._WEATHER_PATTERNS_COMPILED.append((code, compiled))
+
+    @classmethod
+    def _infer_weather_from_text(cls, text: str) -> str | None:
         """Scan an alimnota body for weather phrases when the API
         ``weather`` field is empty. Returns the WEATHER_KO key (e.g.
         ``sunny``, ``rain``) of the first matching phrase, or None.
+        Word-boundary aware so ``나비가`` doesn't trigger 🌧️.
         """
         if not text:
             return None
-        for code, phrases in WEATHER_INFER_PATTERNS:
-            for ph in phrases:
-                if ph in text:
+        cls._ensure_weather_patterns()
+        for code, patterns in cls._WEATHER_PATTERNS_COMPILED or []:
+            for pat in patterns:
+                if pat.search(text):
                     return code
         return None
 
