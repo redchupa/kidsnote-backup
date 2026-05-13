@@ -92,6 +92,19 @@ def _get_ollama() -> dict[str, str] | None:
 _LOGGER = logging.getLogger(__name__)
 
 
+def _safe_url(url: str) -> str:
+    """Strip query string from a URL so signed-URL tokens never reach logs.
+
+    Kidsnote media URLs carry temporary signed-URL tokens (S3-style ``?Signature=…``)
+    that can be replayed before they expire. The path/host part is fine for
+    debugging which asset failed; the query string is the only sensitive bit,
+    so drop it.
+    """
+    if not isinstance(url, str):
+        return str(url)
+    return url.split("?", 1)[0]
+
+
 def compress_image_to_bytes(
     raw: bytes,
     target_bytes: int,
@@ -1313,7 +1326,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw = resp.content
             except Exception as e:
-                _LOGGER.warning("menu photo download failed (%s): %s", url, e)
+                _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), e)
                 continue
             hint = img.get("original_file_name") or f"menu_{text_field}.jpg"
             fid = self._upload_one_image(raw, hint)
@@ -1500,7 +1513,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("photo download failed (%s): %s", url, e)
+                _LOGGER.warning("photo download failed (%s): %s", _safe_url(url), e)
                 images_failed += 1
                 continue
             hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
@@ -1537,7 +1550,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("video download failed (%s): %s", url, e)
+                _LOGGER.warning("video download failed (%s): %s", _safe_url(url), e)
                 videos_failed += 1
                 continue
             hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
@@ -1562,7 +1575,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("file download failed (%s): %s", url, e)
+                _LOGGER.warning("file download failed (%s): %s", _safe_url(url), e)
                 files_failed += 1
                 continue
             hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
@@ -1692,7 +1705,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("photo download failed (%s): %s", url, e)
+                _LOGGER.warning("photo download failed (%s): %s", _safe_url(url), e)
                 images_failed += 1
                 continue
             hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
@@ -1724,7 +1737,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("video download failed (%s): %s", url, e)
+                _LOGGER.warning("video download failed (%s): %s", _safe_url(url), e)
                 videos_failed += 1
                 continue
             hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
@@ -1749,7 +1762,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw_bytes = resp.content
             except Exception as e:
-                _LOGGER.warning("file download failed (%s): %s", url, e)
+                _LOGGER.warning("file download failed (%s): %s", _safe_url(url), e)
                 files_failed += 1
                 continue
             hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
@@ -1997,7 +2010,7 @@ class NotionMirror:
                         else:
                             images_failed += 1
                     except Exception as e:
-                        _LOGGER.warning("menu photo download failed (%s): %s", url, e)
+                        _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), e)
                         images_failed += 1
 
         # Resolve property names + assemble payload.

@@ -837,5 +837,3 @@ GitHub Issues 페이지에 질문을 올려주세요: https://github.com/redchup
 # 📄 라이선스
 
 [MIT](LICENSE). 자유롭게 fork·수정·재배포 가능.
-
-단, **본인 fork에는 자녀 개인정보가 GitHub Actions 로그를 통해 노출될 가능성이 있으니** 일반적으로 fork는 그대로 두고 백업만 돌리세요. 코드 수정 후 다른 사람에게 공개할 때는 자신의 데이터가 안 묻어 있는지 한 번 더 확인해 주세요.

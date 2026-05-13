@@ -69,6 +69,18 @@ FILE_LIST_KEYS = ("attached_files", "files", "attachments")
 _LOGGER = logging.getLogger("kidsnote_fetch")
 
 
+def _safe_url(url: str) -> str:
+    """Strip the query string from a URL so signed-URL tokens never reach logs.
+
+    Kidsnote media URLs carry temporary signed-URL tokens that can be replayed
+    before they expire; the path/host part is fine for debugging, the query
+    string is the only sensitive bit.
+    """
+    if not isinstance(url, str):
+        return str(url)
+    return url.split("?", 1)[0]
+
+
 def _load_env_file(path: Path) -> dict[str, str]:
     """Tiny .env parser — no python-dotenv dep, no shell expansion."""
     out: dict[str, str] = {}
@@ -442,7 +454,7 @@ def _download_attachment(
         return True
     except Exception as e:
         _LOGGER.warning("attachment %s (%s) failed in %s: %s",
-                        name, url, folder.name, e)
+                        name, _safe_url(url), folder.name, e)
         return False
 
 
