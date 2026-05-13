@@ -457,11 +457,21 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result = mirror.publish_report(r, sess)
                 published += 1
+                # Compact summary: each ratio shown only if any of that kind exists.
+                attach_parts: list[str] = []
+                img_tot = result["images_uploaded"] + result["images_failed"]
+                if img_tot:
+                    attach_parts.append(f"img={result['images_uploaded']}/{img_tot}")
+                vid_tot = result["videos_uploaded"] + result["videos_failed"]
+                if vid_tot:
+                    attach_parts.append(f"vid={result['videos_uploaded']}/{vid_tot}")
+                file_tot = result["files_uploaded"] + result["files_failed"]
+                if file_tot:
+                    attach_parts.append(f"file={result['files_uploaded']}/{file_tot}")
+                attach_str = (" " + " ".join(attach_parts)) if attach_parts else ""
                 _LOGGER.info(
-                    "Progress %5.1f%% (%d/%d) | Notion +1 rid=%d images=%d/%d",
-                    pct, idx, total_target, rid,
-                    result["images_uploaded"],
-                    result["images_uploaded"] + result["images_failed"],
+                    "Progress %5.1f%% (%d/%d) | Notion +1 rid=%d%s",
+                    pct, idx, total_target, rid, attach_str,
                 )
             except Exception as e:
                 failed += 1

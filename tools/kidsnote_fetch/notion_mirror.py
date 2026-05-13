@@ -306,6 +306,83 @@ class NotionMirror:
 
         return file_upload_id
 
+    # ----------------------------------------------------------- video / file upload
+
+    @staticmethod
+    def _guess_mime(filename: str) -> str:
+        """Map a filename suffix to an HTTP-friendly MIME type."""
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+        return {
+            "mp4": "video/mp4",
+            "mov": "video/quicktime",
+            "m4v": "video/mp4",
+            "webm": "video/webm",
+            "avi": "video/x-msvideo",
+            "mkv": "video/x-matroska",
+            "pdf": "application/pdf",
+            "doc": "application/msword",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls": "application/vnd.ms-excel",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "ppt": "application/vnd.ms-powerpoint",
+            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "txt": "text/plain",
+            "zip": "application/zip",
+        }.get(ext, "application/octet-stream")
+
+    def _upload_one_blob(
+        self,
+        raw: bytes,
+        filename: str,
+        *,
+        kind: str,  # "video" or "file" — for logging only
+    ) -> str | None:
+        """Upload a non-image attachment as-is (no compression).
+
+        Notion's per-file cap (5 MiB on free tier) is enforced strictly here:
+        anything over the cap is skipped with a warning. Returns file_upload_id
+        or None on skip/error. Used for videos and generic files (PDF/XLSX/...).
+        """
+        if len(raw) > self.max_image_bytes:
+            _LOGGER.warning(
+                "%s %s is %d bytes > %d cap; skipping (Notion free tier limit)",
+                kind, filename, len(raw), self.max_image_bytes,
+            )
+            return None
+
+        mime = self._guess_mime(filename)
+        try:
+            r = self.session.post(
+                f"{NOTION_API}/file_uploads",
+                headers=self._headers(),
+                json={},
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            handle = r.json()
+            upload_url = handle["upload_url"]
+            file_upload_id = handle["id"]
+        except Exception as e:
+            _LOGGER.warning("file_uploads create failed for %s %s: %s", kind, filename, e)
+            return None
+
+        try:
+            r = self.session.post(
+                upload_url,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": NOTION_VERSION,
+                },
+                files={"file": (filename, io.BytesIO(raw), mime)},
+                timeout=self.timeout * 3,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            _LOGGER.warning("%s upload PUT failed for %s: %s", kind, filename, e)
+            return None
+
+        return file_upload_id
+
     # ----------------------------------------------------------- page build
 
     @staticmethod
@@ -326,7 +403,9 @@ class NotionMirror:
     def _build_children(
         self,
         report: dict[str, Any],
-        file_upload_ids: list[str],
+        image_upload_ids: list[str],
+        video_upload_ids: list[str],
+        file_upload_ids: list[tuple[str, str]],  # list of (id, filename)
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
@@ -350,19 +429,54 @@ class NotionMirror:
                 blocks.append(self._para(chunk))
 
         # Photos (one image block per uploaded file)
-        if file_upload_ids:
+        if image_upload_ids:
             blocks.append({
                 "object": "block",
                 "type": "heading_3",
                 "heading_3": {"rich_text": [{"type": "text", "text": {"content": "사진"}}]},
             })
-            for fid in file_upload_ids:
+            for fid in image_upload_ids:
                 blocks.append({
                     "object": "block",
                     "type": "image",
                     "image": {
                         "type": "file_upload",
                         "file_upload": {"id": fid},
+                    },
+                })
+
+        # Videos (only those that fit Notion's per-file cap)
+        if video_upload_ids:
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "동영상"}}]},
+            })
+            for fid in video_upload_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "video",
+                    "video": {
+                        "type": "file_upload",
+                        "file_upload": {"id": fid},
+                    },
+                })
+
+        # Generic file attachments (PDF, Excel, etc.)
+        if file_upload_ids:
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "첨부 파일"}}]},
+            })
+            for fid, fname in file_upload_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "file",
+                    "file": {
+                        "type": "file_upload",
+                        "file_upload": {"id": fid},
+                        "name": fname[:100],
                     },
                 })
 
@@ -391,7 +505,7 @@ class NotionMirror:
         title = f"[{date_str}] 알림장 #{report_id}"
 
         # Upload photos first so we can drop image blocks into the page body.
-        file_upload_ids: list[str] = []
+        image_upload_ids: list[str] = []
         images_failed = 0
         for img in report.get("attached_images") or []:
             if not isinstance(img, dict):
@@ -416,11 +530,75 @@ class NotionMirror:
             hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
             fid = self._upload_one_image(raw_bytes, hint)
             if fid:
-                file_upload_ids.append(fid)
+                image_upload_ids.append(fid)
             else:
                 images_failed += 1
 
-        children = self._build_children(report, file_upload_ids)
+        # Videos: kidsnote stores it as a single object (or None / list of 1).
+        # Notion's per-file cap (5 MiB free) applies; over-cap videos are skipped.
+        video_upload_ids: list[str] = []
+        videos_failed = 0
+        video_objs: list[dict[str, Any]] = []
+        for k in ("attached_video", "video", "attached_videos"):
+            v = report.get(k)
+            if isinstance(v, dict):
+                video_objs.append(v)
+                break
+            if isinstance(v, list) and v:
+                video_objs.extend(x for x in v if isinstance(x, dict))
+                break
+        for vobj in video_objs:
+            url = (
+                vobj.get("original")
+                or vobj.get("high")
+                or vobj.get("url")
+            )
+            if not url:
+                videos_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=180)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("video download failed (%s): %s", url, e)
+                videos_failed += 1
+                continue
+            hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
+            fid = self._upload_one_blob(raw_bytes, hint, kind="video")
+            if fid:
+                video_upload_ids.append(fid)
+            else:
+                videos_failed += 1
+
+        # Other file attachments (PDF, Excel, etc.) — same 5 MiB cap.
+        file_upload_ids: list[tuple[str, str]] = []
+        files_failed = 0
+        for fobj in report.get("attached_files") or []:
+            if not isinstance(fobj, dict):
+                continue
+            url = fobj.get("original") or fobj.get("url")
+            if not url:
+                files_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=180)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("file download failed (%s): %s", url, e)
+                files_failed += 1
+                continue
+            hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
+            fid = self._upload_one_blob(raw_bytes, hint, kind="file")
+            if fid:
+                file_upload_ids.append((fid, hint))
+            else:
+                files_failed += 1
+
+        children = self._build_children(
+            report, image_upload_ids, video_upload_ids, file_upload_ids,
+        )
 
         # Resolve property names on first publish (cached for subsequent calls).
         self._resolve_schema()
@@ -455,8 +633,12 @@ class NotionMirror:
             "page_url": page.get("url", ""),
             "report_id": report_id,
             "title": title,
-            "images_uploaded": len(file_upload_ids),
+            "images_uploaded": len(image_upload_ids),
             "images_failed": images_failed,
+            "videos_uploaded": len(video_upload_ids),
+            "videos_failed": videos_failed,
+            "files_uploaded": len(file_upload_ids),
+            "files_failed": files_failed,
         }
 
 
