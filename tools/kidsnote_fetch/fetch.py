@@ -469,6 +469,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Skip photo album sync.")
     ap.add_argument("--limit", type=int,
                     help="Only sync the N most recent reports (debugging).")
+    ap.add_argument("--monthly-sample", action="store_true",
+                    help="For unit testing: pick one report per month (newest "
+                         "of each calendar month), instead of N most-recent. "
+                         "Useful to verify coverage across a wide date range.")
     ap.add_argument("--dump-raw", action="store_true",
                     help="Dump the raw /reports/ JSON to backup_root for inspection. "
                          "Ignored when --no-local-save is set.")
@@ -537,7 +541,20 @@ def main(argv: list[str] | None = None) -> int:
         target = children[0]
 
     reports = _list_reports(sess, int(target["id"]))
-    if args.limit:
+    if args.monthly_sample:
+        # One report per (YYYY-MM). Reports are newest-first so the first
+        # seen per month is the latest of that month.
+        seen_months: set[str] = set()
+        sampled: list[dict[str, Any]] = []
+        for r in reports:
+            ym = (r.get("date_written") or "")[:7]
+            if ym and ym not in seen_months:
+                seen_months.add(ym)
+                sampled.append(r)
+        reports = sampled
+        _LOGGER.info("monthly-sample mode: kept %d reports (one per month)",
+                     len(reports))
+    elif args.limit:
         reports = reports[: args.limit]
     _LOGGER.info("fetched %d reports for child id=%s",
                  len(reports), target.get("id"))

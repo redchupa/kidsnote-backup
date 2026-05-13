@@ -25,6 +25,12 @@ on:
         description: "Only mirror the N most recent reports (leave empty for all)"
         required: false
         default: ""
+      monthly_sample:
+        description: "Unit-test mode: pick one report per month for breadth coverage"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -70,6 +76,9 @@ jobs:
           ARGS=( "--auth-mode" "session-cookie-env" "--publish-to-notion" "--no-local-save" )
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS+=( "--limit" "${{ inputs.limit }}" )
+          fi
+          if [ "${{ inputs.monthly_sample }}" = "true" ]; then
+            ARGS+=( "--monthly-sample" )
           fi
           python tools/kidsnote_fetch/fetch.py "${ARGS[@]}"
 
