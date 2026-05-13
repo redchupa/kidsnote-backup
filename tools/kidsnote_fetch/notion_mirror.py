@@ -92,6 +92,47 @@ def _get_ollama() -> dict[str, str] | None:
 _LOGGER = logging.getLogger(__name__)
 
 
+# Two-syllable Korean surnames. Anything not in this list is treated as a
+# 1-syllable surname (the overwhelming majority).
+_TWO_SYL_SURNAMES = ("황보", "남궁", "선우", "독고", "제갈", "사공", "서문", "동방")
+
+
+def _given_name(full_name: str) -> str:
+    """Return just the given name (이름) part of a Korean full name.
+
+    Kidsnote stores ``성+이름`` together (e.g. ``우하린``), but a parent
+    addresses the child by given name only (``하린아``). Strip the
+    surname conservatively: 1 syllable by default, 2 syllables for the
+    handful of well-known compound surnames.
+    """
+    if not full_name:
+        return ""
+    if full_name[:2] in _TWO_SYL_SURNAMES:
+        return full_name[2:]
+    return full_name[1:] if len(full_name) > 1 else full_name
+
+
+def _vocative_marker(name: str) -> str:
+    """Pick the right Korean vocative ending: ``야`` after a vowel-final
+    syllable, ``아`` after a consonant-final one (받침 check)."""
+    if not name:
+        return "야"
+    last = name[-1]
+    if not ("가" <= last <= "힣"):
+        return "야"
+    jongseong = (ord(last) - 0xAC00) % 28
+    return "야" if jongseong == 0 else "아"
+
+
+def _addressee(child_name: str) -> str:
+    """Compose ``우리 {이름}{야|아}`` for parent-to-child letters; falls back
+    to a generic affectionate phrase when no name is available."""
+    given = _given_name(child_name)
+    if not given:
+        return "사랑하는 아이야"
+    return f"우리 {given}{_vocative_marker(given)}"
+
+
 def _safe_url(url: str) -> str:
     """Strip query string from a URL so signed-URL tokens never reach logs.
 
@@ -930,11 +971,14 @@ class NotionMirror:
         """Convert teacher's alimnota into child's first-person diary."""
         if not text or len(text.strip()) < 30:
             return None
-        name_hint = f" 자녀 이름은 ``{child_name}``." if child_name else ""
+        given = _given_name(child_name)
+        name_hint = f" 자녀 이름은 ``{given}``." if given else ""
         prompt = (
             "다음 어린이집 알림장 본문을 자녀의 1인칭(``나``) 시점 일기로 "
-            "한국어로 짧게(2-3문장) 바꿔써. 어린이 어휘로 자연스럽게."
-            f"{name_hint} 다른 설명 없이 일기 본문만 답해.\n\n"
+            "한국어로만 짧게(2-3문장) 바꿔써. 어린이 어휘로 자연스럽게."
+            f"{name_hint} **규칙**: ① 한국어만 사용 — 중국어/한자 절대 금지. "
+            "② 본문에 적힌 내용만 사용 — 없는 사실(나이, 몸무게, 시간, 사물 "
+            "등) 만들지 마. ③ 다른 설명 없이 일기 본문만 답해.\n\n"
             f"본문: {text[:1500]}\n\n자녀의 일기:"
         )
         return cls._ask_ollama(prompt, max_chars=350, num_predict=120)
@@ -944,19 +988,22 @@ class NotionMirror:
         """Parent-to-child love letter inspired by today's alimnota.
 
         Written so the child, years later, will feel moved when reading it
-        back — addresses the child directly (``우리 ~야``), warm and
-        intimate, NOT the parent's third-person diary about the day.
+        back — addresses the child directly with the proper Korean
+        vocative (``우리 하린아`` / ``우리 수아야``), warm and intimate,
+        NOT the parent's third-person diary about the day.
         """
         if not text or len(text.strip()) < 30:
             return None
-        addressee = f"우리 {child_name}야" if child_name else "사랑하는 아이야"
+        addressee = _addressee(child_name)
         prompt = (
             "다음은 어린이집에서 받은 알림장이야. 이 알림장을 읽은 부모가 "
             "자녀에게 직접 들려주고 싶은 따뜻한 한 마디를, 자녀가 자라서 "
             "이 글을 다시 보았을 때 감동받을 수 있도록 짧은 편지(2-3문장)로 "
-            f"써. 반드시 ``{addressee}``로 시작하고, 부모가 자녀에게 직접 "
+            f"써. 반드시 ``{addressee},``로 시작하고, 부모가 자녀에게 직접 "
             "말하는 다정한 어조로. 부모의 사랑·자랑·기특함이 느껴지게. "
-            "다른 설명 없이 편지 본문만 답해.\n\n"
+            "**규칙**: ① 한국어만 사용 — 중국어 한자 절대 금지. ② 알림장에 "
+            "적힌 내용만 사용 — 없는 사실(나이, 몸무게, 시간 등) 만들지 마. "
+            "③ 다른 설명 없이 편지 본문만 답해.\n\n"
             f"알림장: {text[:1500]}\n\n자녀에게:"
         )
         return cls._ask_ollama(prompt, max_chars=400, num_predict=150)
@@ -2584,12 +2631,17 @@ class NotionMirror:
             joined = "\n\n".join(
                 (r.get("content") or "").strip()[:300] for r in items[:30]
             )[:4500]
+            given = _given_name(child_name)
             prompt = (
                 f"다음은 어린이집 자녀의 {ym} 한 달치 알림장 모음이야. "
                 "이를 바탕으로 그 달의 자녀 성장 스토리를 따뜻한 톤의 "
                 "한 단락(3-4문장)으로 한국어로 써줘. "
-                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
-                "다른 설명 없이 본문만 답해.\n\n"
+                f"{'자녀 이름은 ``' + given + '``.' if given else ''} "
+                "**규칙**: ① 한국어만 사용 — 중국어 한자 절대 금지. "
+                "② 알림장에 적힌 사실만 사용 — 없는 사건(담배, 음주, 가상의 "
+                "나이/몸무게/시간 등) 절대 만들지 마. ③ 자녀를 직접 호명하지 "
+                "말고 ``우리 아이`` 또는 이름(``" + (given or "아이") + "``)으로만 지칭. "
+                "④ 다른 설명 없이 본문만 답해.\n\n"
                 f"알림장 모음:\n{joined}\n\n성장 스토리:"
             )
             story = self._ask_ollama(prompt, max_chars=600, num_predict=300, timeout=180)
@@ -2642,11 +2694,14 @@ class NotionMirror:
             if not body or len(body) < 40:
                 continue
             date = (r.get("date_written") or "")[:10]
+            given = _given_name(child_name)
             prompt = (
                 "다음 어린이집 알림장 본문에서 자녀가 "
                 "``처음으로 X를 했다`` 류의 발달 마일스톤이 있다면 "
                 "한 줄(15자 이내)로 추출해. 없으면 ``없음`` 한 단어만 답해. "
-                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''}\n\n"
+                f"{'자녀 이름은 ``' + given + '``.' if given else ''} "
+                "**규칙**: 한국어만 사용 (중국어 한자 금지). 본문에 적힌 "
+                "내용만 사용. 본문에 명시되지 않은 마일스톤은 절대 만들지 마.\n\n"
                 f"본문: {body[:1200]}\n\n마일스톤:"
             )
             ms = self._ask_ollama(prompt, max_chars=60, num_predict=40, timeout=60)
@@ -2696,12 +2751,15 @@ class NotionMirror:
             joined = "\n".join(
                 (r.get("content") or "").strip()[:250] for r in items[:40]
             )[:5000]
+            given = _given_name(child_name)
             prompt = (
                 f"다음은 어린이집 자녀의 {q} 분기 알림장 모음이야. "
                 "자녀가 이 기간 가장 좋아한 활동·사물·사람을 TOP 5로 정리해. "
                 "각 항목은 한 줄로 ``1. ... `` ``2. ...`` 형태로. "
-                f"{'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
-                "다른 설명 없이 목록만 답해.\n\n"
+                f"{'자녀 이름은 ``' + given + '``.' if given else ''} "
+                "**규칙**: ① 한국어만 사용 (중국어 한자 금지). ② 알림장에 "
+                "실제 등장한 활동/사물/사람만 포함 — 없는 항목 추가 금지. "
+                "③ 다른 설명 없이 1~5번 목록만 답해.\n\n"
                 f"알림장:\n{joined}\n\nTOP 5:"
             )
             top = self._ask_ollama(prompt, max_chars=400, num_predict=200, timeout=120)
@@ -2744,11 +2802,14 @@ class NotionMirror:
         joined = "\n\n".join(
             (r.get("content") or "").strip()[:300] for r in teacher_reports
         )[:8000]
+        given = _given_name(child_name)
         prompt = (
             "다음은 어린이집 선생님이 1년 동안 작성한 알림장 모음이야. "
             "이 선생님께 보낼 진심 어린 감사 편지를 한국어로 5-6문장으로 "
-            f"써줘. {'자녀 이름은 ``' + child_name + '``.' if child_name else ''} "
-            "편지 본문만 답해.\n\n"
+            f"써줘. {'자녀 이름은 ``' + given + '``.' if given else ''} "
+            "**규칙**: ① 한국어만 사용 (중국어 한자 금지). ② 알림장에 "
+            "실제 등장한 활동·에피소드를 인용하면서 작성. 없는 사건 "
+            "만들지 마. ③ 편지 본문만 답해.\n\n"
             f"알림장 모음:\n{joined}\n\n감사 편지:"
         )
         letter = self._ask_ollama(prompt, max_chars=900, num_predict=400, timeout=180)

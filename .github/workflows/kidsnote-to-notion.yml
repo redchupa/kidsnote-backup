@@ -65,15 +65,17 @@ jobs:
           # to Notion's 5 MiB per-file cap.
           pip install pillow piexif
 
-      # ---- Ollama for body summary (optional but recommended) ----
+      # ---- Ollama for body summary + LLM dashboards ----
       # Local LLM runs inside the runner — no API key / cost.
-      # qwen2.5:1.5b is small (~1GB) + Korean-capable.
+      # qwen2.5:7b is ~4.5GB but the 1.5b output mixed Chinese hanja and
+      # fabricated facts ("담배를 하나 빼고는…"), unusable as a keepsake.
+      # 7b on cached GHA runner pulls in ~30s after cache hit.
       - name: Cache Ollama models
         id: ollama-cache
         uses: actions/cache@v4
         with:
           path: ~/.ollama
-          key: ollama-qwen2.5-1.5b-v1
+          key: ollama-qwen2.5-7b-v1
 
       - name: Install Ollama + pull model
         run: |
@@ -91,7 +93,7 @@ jobs:
             sleep 1
           done
           # Pull model (cached after first run)
-          ollama pull qwen2.5:1.5b
+          ollama pull qwen2.5:7b
 
       - name: Mirror Kidsnote → Notion
         env:
@@ -100,7 +102,7 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           # Tell notion_mirror.py where Ollama lives + which model to use
           OLLAMA_HOST: "http://localhost:11434"
-          OLLAMA_MODEL: "qwen2.5:1.5b"
+          OLLAMA_MODEL: "qwen2.5:7b"
           PYTHONUNBUFFERED: "1"
         run: |
           set -eu
