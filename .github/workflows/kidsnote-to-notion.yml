@@ -1,26 +1,20 @@
-# Kidsnote → Notion mirror (private-fork only)
+# Kidsnote → Notion mirror
 #
 # MANUAL EXECUTION ONLY. Kidsnote's login flow can no longer be driven by
-# a headless HTTP client (the page is a Next.js SPA, and Kakao SSO accounts
-# need full browser JS). So the workflow relies on a `sessionid` cookie
-# the operator extracts manually from a logged-in Firefox session and
-# stores in the KIDSNOTE_SESSION_COOKIE secret. That cookie typically lasts
-# ~30 days; when it expires, re-extract and re-run.
+# a headless HTTP client (the page is a Next.js SPA). So the workflow
+# relies on a `sessionid` cookie the operator extracts manually from a
+# logged-in browser session (Chrome F12 → Application → Cookies) and
+# stores in the KIDSNOTE_SESSION_COOKIE secret. That cookie typically
+# lasts ~30 days; when it expires, re-extract and re-run.
 #
 # Dedup: each new Notion page records the kidsnote `Report ID`. Subsequent
 # runs query the DB once at startup and skip reports whose id is already
 # stored, so re-running is safe and idempotent.
 #
-# IMPORTANT — this workflow expects four GitHub repository secrets:
-#   KIDSNOTE_SESSION_COOKIE                (sessionid value from logged-in Firefox)
-#   NOTION_TOKEN, NOTION_DATABASE_ID       (an integration + the target DB)
-# Optional (fallback only, currently unused):
-#   KIDSNOTE_USERNAME, KIDSNOTE_PASSWORD   (direct-login - broken on SPA)
-#
-# It also expects tools/kidsnote_fetch/ to be CHECKED IN — the public repo
-# .gitignore excludes it, so you must `git add -f tools/` in your own
-# private fork to make it visible to Actions. See tools/kidsnote_fetch/README.md
-# for the full setup.
+# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+#   KIDSNOTE_SESSION_COOKIE   value of the `sessionid` cookie for kidsnote.com
+#   NOTION_TOKEN              internal integration token from notion.so/profile/integrations
+#   NOTION_DATABASE_ID        32-char hex id from your Notion DB URL
 
 name: Kidsnote → Notion mirror
 
@@ -57,56 +51,36 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Ensure side tool is present (private fork gate)
-        run: |
-          if [ ! -f tools/kidsnote_fetch/fetch.py ]; then
-            echo "::error::tools/kidsnote_fetch/fetch.py is missing."
-            echo "This workflow is for private forks that have run"
-            echo "'git add -f tools/' to override the public-repo .gitignore."
-            exit 1
-          fi
-
       - name: Install fetcher deps + image helpers
         run: |
           python -m pip install --upgrade pip
           pip install -r tools/kidsnote_fetch/requirements.txt
-          # image_compress.py from the package uses Pillow + piexif;
-          # install them directly so the side tool can `from
-          # kidsnote_diary_suite.publisher.image_compress import ...`.
+          # Pillow + piexif for in-memory EXIF strip + auto-compress
+          # to Notion's 5 MiB per-file cap.
           pip install pillow piexif
 
       - name: Mirror Kidsnote → Notion
         env:
-          KIDSNOTE_USERNAME: ${{ secrets.KIDSNOTE_USERNAME }}
-          KIDSNOTE_PASSWORD: ${{ secrets.KIDSNOTE_PASSWORD }}
           KIDSNOTE_SESSION_COOKIE: ${{ secrets.KIDSNOTE_SESSION_COOKIE }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           PYTHONUNBUFFERED: "1"
         run: |
           set -eu
-          # If a sessionid cookie was provided, use it (works for Kakao SSO
-          # accounts in headless CI). Otherwise fall back to direct-login.
-          if [ -n "${KIDSNOTE_SESSION_COOKIE:-}" ]; then
-            AUTH_MODE="session-cookie-env"
-          else
-            AUTH_MODE="direct-login"
-          fi
-          ARGS=( "--auth-mode" "$AUTH_MODE" "--publish-to-notion" "--no-local-save" )
+          ARGS=( "--auth-mode" "session-cookie-env" "--publish-to-notion" "--no-local-save" )
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS+=( "--limit" "${{ inputs.limit }}" )
           fi
           python tools/kidsnote_fetch/fetch.py "${ARGS[@]}"
 
-      - name: Verify all four secrets were present
+      - name: Verify required secrets were present
         if: failure()
         env:
-          KIDSNOTE_USERNAME: ${{ secrets.KIDSNOTE_USERNAME }}
-          KIDSNOTE_PASSWORD: ${{ secrets.KIDSNOTE_PASSWORD }}
+          KIDSNOTE_SESSION_COOKIE: ${{ secrets.KIDSNOTE_SESSION_COOKIE }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
-          for s in KIDSNOTE_USERNAME KIDSNOTE_PASSWORD NOTION_TOKEN NOTION_DATABASE_ID; do
+          for s in KIDSNOTE_SESSION_COOKIE NOTION_TOKEN NOTION_DATABASE_ID; do
             if [ -z "${!s:-}" ]; then
               echo "::error::repo secret '$s' is empty or unset"
             fi

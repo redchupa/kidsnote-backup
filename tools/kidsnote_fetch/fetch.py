@@ -115,104 +115,6 @@ def _load_session_from_browser(browser: str) -> requests.Session:
     return sess
 
 
-# Kidsnote's actual login endpoint (confirmed by inspecting the live HTML on
-# 2026-05-13). Despite the site being a Next.js SPA, login itself is a plain
-# server-side form POST to /kr/login with three fields.
-KIDSNOTE_LOGIN_URL = f"{KIDSNOTE_BASE}/kr/login"
-KIDSNOTE_LOGIN_FIELDS = ("username", "password", "remember_me")
-
-
-def _login_direct(username: str, password: str) -> requests.Session:
-    """POST username + password to Kidsnote's /kr/login endpoint.
-
-    Form-encoded body, fields = (username, password, remember_me). Returns the
-    session if login succeeded; raises a RuntimeError otherwise so the caller
-    can fall back to --auth-mode browser-cookie or Playwright.
-    """
-    if not username or not password:
-        raise RuntimeError(
-            "KIDSNOTE_USERNAME / KIDSNOTE_PASSWORD missing. "
-            "Fill them in the .env file (NOT in chat / commits)."
-        )
-    sess = _baseline_session()
-    # Warm-up GET so Next.js / CSRF middleware can plant the initial cookies
-    # (e.g. csrftoken, __Host-next-auth.csrf-token) and any hidden form token.
-    # Skipping this works locally only when the browser left cookies behind;
-    # in CI the session is fresh, so the POST is rejected with status=200 and
-    # no Set-Cookie. Logged separately so failures are obvious.
-    csrf_token: str | None = None
-    try:
-        warmup = sess.get(KIDSNOTE_LOGIN_URL, timeout=30)
-        body_head = (warmup.text or "")[:400].replace("\n", " ")
-        _LOGGER.info(
-            "direct-login warmup: status=%d, cookies=%s, body_head=%r",
-            warmup.status_code, sorted({c.name for c in sess.cookies}), body_head,
-        )
-        m = re.search(
-            r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']',
-            warmup.text or "",
-        )
-        if m:
-            csrf_token = m.group(1)
-    except requests.RequestException as e:
-        raise RuntimeError(f"direct-login warmup network error: {e}") from e
-
-    payload = {
-        "username": username,
-        "password": password,
-        "remember_me": "on",
-    }
-    if csrf_token:
-        payload["csrfmiddlewaretoken"] = csrf_token
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": KIDSNOTE_BASE,
-        "Referer": KIDSNOTE_LOGIN_URL,
-    }
-    # Django-style CSRF: also send the cookie value as X-CSRFToken header.
-    for c in sess.cookies:
-        if c.name.lower() == "csrftoken":
-            headers["X-CSRFToken"] = c.value or ""
-            break
-    try:
-        r = sess.post(
-            KIDSNOTE_LOGIN_URL,
-            data=payload,
-            headers=headers,
-            allow_redirects=True,
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"direct-login network error: {e}") from e
-
-    cookie_names = {c.name.lower() for c in sess.cookies}
-    has_session = bool(cookie_names & {
-        "sessionid", "session", "session_id", "csrftoken",
-        "kidsnote_session", "nextjs-session",
-    })
-    redirected_away = r.url != KIDSNOTE_LOGIN_URL and "/login" not in r.url
-
-    if r.status_code < 400 and (has_session or redirected_away):
-        _LOGGER.info(
-            "direct-login OK: status=%d, final_url=%s, cookies=%s",
-            r.status_code, r.url, sorted(cookie_names),
-        )
-        # If CSRF protection kicks in for /api/v1_2 calls, propagate the token.
-        for c in sess.cookies:
-            if c.name.lower() == "csrftoken":
-                sess.headers["X-CSRFToken"] = c.value or ""
-                break
-        return sess
-
-    raise RuntimeError(
-        "direct-login failed: "
-        f"status={r.status_code}, final_url={r.url}, "
-        f"cookies={sorted(cookie_names) or 'none'}. "
-        "If you log in with Kakao (SSO), direct-login is not supported - "
-        "use --auth-mode browser-cookie with Firefox instead."
-    )
-
-
 def _list_children(sess: requests.Session) -> list[dict[str, Any]]:
     """Look up the children registered under the logged-in account.
 
@@ -428,16 +330,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="Mirror each new report to a Notion database. "
                          "Reads NOTION_TOKEN + NOTION_DATABASE_ID from .env or "
                          "process env (whichever is set).")
-    ap.add_argument("--auth-mode", default="direct-login",
-                    choices=["direct-login", "browser-cookie", "session-cookie-env"],
-                    help="direct-login: reads KIDSNOTE_USERNAME/PASSWORD from --env-file or env. "
-                         "browser-cookie: pulls cookies from a logged-in browser. "
-                         "session-cookie-env: reads KIDSNOTE_SESSION_COOKIE (value of `sessionid`) "
-                         "from env - the only mode that works for Kakao SSO accounts in headless CI.")
+    ap.add_argument("--auth-mode", default="session-cookie-env",
+                    choices=["session-cookie-env", "browser-cookie"],
+                    help="session-cookie-env (default): reads KIDSNOTE_SESSION_COOKIE "
+                         "(value of `sessionid`) from env. Required for headless CI. "
+                         "browser-cookie: pulls cookies from a locally logged-in browser.")
     ap.add_argument("--env-file", type=Path,
                     default=Path(__file__).resolve().parents[2] / ".env",
-                    help="Path to the .env that holds KIDSNOTE_USERNAME / KIDSNOTE_PASSWORD. "
-                         "Ignored if the same names exist in process env (CI mode).")
+                    help="Path to the .env that holds KIDSNOTE_SESSION_COOKIE / NOTION_TOKEN / "
+                         "NOTION_DATABASE_ID. Ignored if the same names exist in process env (CI mode).")
     ap.add_argument("--browser", default="auto",
                     choices=["chrome", "firefox", "edge", "auto"],
                     help="(--auth-mode browser-cookie only)")
@@ -465,21 +366,12 @@ def main(argv: list[str] | None = None) -> int:
     env = _load_env_file(args.env_file) if args.env_file.exists() else {}
 
     # ---- auth -----
-    if args.auth_mode == "direct-login":
-        u = _resolve_secret(env, "KIDSNOTE_USERNAME")
-        p = _resolve_secret(env, "KIDSNOTE_PASSWORD")
-        if not u or not p:
-            sys.exit(
-                "KIDSNOTE_USERNAME / KIDSNOTE_PASSWORD missing. "
-                "Set them in .env (local) or as repo secrets (GitHub Actions)."
-            )
-        sess = _login_direct(u, p)
-    elif args.auth_mode == "session-cookie-env":
+    if args.auth_mode == "session-cookie-env":
         cookie_val = _resolve_secret(env, "KIDSNOTE_SESSION_COOKIE")
         if not cookie_val:
             sys.exit(
                 "KIDSNOTE_SESSION_COOKIE missing. Extract the `sessionid` cookie "
-                "value for kidsnote.com from a logged-in Firefox session and "
+                "value for kidsnote.com from a logged-in browser session and "
                 "set it in .env (local) or as a repo secret (GitHub Actions)."
             )
         sess = _baseline_session()
