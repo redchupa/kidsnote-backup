@@ -149,6 +149,80 @@ def _list_reports(
     return body.get("results") or body.get("reports") or []
 
 
+def _list_menus(
+    sess: requests.Session, center_id: int, page_size: int = 9999
+) -> list[dict[str, Any]]:
+    """Daily lunch menu for a daycare center. Confirmed live on 2026-05-13:
+
+        GET /api/v1/centers/<center_id>/menu/?page_size=9999
+
+    Each result: {id, date_menu, morning, morning_snack, lunch,
+    afternoon_snack, dinner} + per-item *_img attachments
+    (Kakao-CDN photos of the served food). `date_menu` is ISO date.
+    """
+    url = f"{KIDSNOTE_BASE}/api/v1/centers/{center_id}/menu/"
+    r = sess.get(url, params={"page_size": page_size}, timeout=60)
+    r.raise_for_status()
+    body = r.json()
+    return body.get("results") or []
+
+
+def _list_paginated(
+    sess: requests.Session, url: str, page_size: int = 100, max_pages: int = 200
+) -> list[dict[str, Any]]:
+    """Walk a cursor-paginated DRF endpoint until exhausted.
+
+    Some kidsnote endpoints (notices, albums) use cursor-style pagination
+    where `next` is either a full URL or a base64 token. This helper
+    handles both forms and aggregates results.
+    """
+    out: list[dict[str, Any]] = []
+    next_url: str | None = url
+    pages = 0
+    while next_url and pages < max_pages:
+        sep = "&" if "?" in next_url else "?"
+        # If next_url already has page_size we don't re-add it.
+        if "page_size=" not in next_url:
+            next_url = f"{next_url}{sep}page_size={page_size}"
+        r = sess.get(next_url, timeout=60)
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body.get("results") or [])
+        nxt = body.get("next")
+        if not nxt:
+            break
+        if nxt.startswith("http"):
+            next_url = nxt
+        else:
+            # bare cursor token — append to original endpoint
+            base = url.split("?")[0]
+            next_url = f"{base}?page_size={page_size}&cursor={nxt}"
+        pages += 1
+    return out
+
+
+def _list_notices(
+    sess: requests.Session, center_id: int
+) -> list[dict[str, Any]]:
+    """Center-wide notices (`/api/v1/centers/<id>/notices/`).
+
+    Cursor-paginated; we walk the full history. Each result has the same
+    shape as a report (title/content/author/attached_images/video/files).
+    """
+    return _list_paginated(
+        sess, f"{KIDSNOTE_BASE}/api/v1/centers/{center_id}/notices/"
+    )
+
+
+def _list_albums(
+    sess: requests.Session, child_id: int
+) -> list[dict[str, Any]]:
+    """Photo albums for one child (`/api/v1/children/<id>/albums/`)."""
+    return _list_paginated(
+        sess, f"{KIDSNOTE_BASE}/api/v1/children/{child_id}/albums/"
+    )
+
+
 def _first_existing_key(d: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for k in keys:
         if k in d:
@@ -344,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="(--auth-mode browser-cookie only)")
     ap.add_argument("--child-id", type=int,
                     help="Pick a specific child id; defaults to the first one.")
+    ap.add_argument("--no-menus", action="store_true",
+                    help="Skip daily lunch menu sync.")
+    ap.add_argument("--no-notices", action="store_true",
+                    help="Skip center-wide notice sync.")
+    ap.add_argument("--no-albums", action="store_true",
+                    help="Skip photo album sync.")
     ap.add_argument("--limit", type=int,
                     help="Only sync the N most recent reports (debugging).")
     ap.add_argument("--dump-raw", action="store_true",
@@ -437,52 +517,99 @@ def main(argv: list[str] | None = None) -> int:
         _LOGGER.info("local save: %d reports, %d new files under %s",
                      len(reports), total_new_files, args.backup_root)
 
-    # ---- Notion mirror (optional) -----
-    if mirror is not None:
-        # Pre-count: how many reports are actually new (need publishing) vs
-        # already in Notion DB. Used for percentage progress in the log.
-        to_publish = [r for r in reports if int(r.get("id", 0)) not in skip_ids]
-        already_existed = len(reports) - len(to_publish)
-        total_target = len(to_publish)
+    # ---- helper: publish a batch of items via the given publish method ----
+    def _publish_batch(
+        items: list[dict[str, Any]],
+        publish_fn: Any,
+        kind_label: str,
+    ) -> None:
+        # `publish_fn` is mirror.publish_notice / publish_album / publish_menu.
+        # Dedup against the same skip_ids set (Report ID is shared column).
+        to_pub = [x for x in items if int(x.get("id", 0)) not in skip_ids]
+        already = len(items) - len(to_pub)
+        total = len(to_pub)
         _LOGGER.info(
-            "Notion mirror: %d total fetched, %d already in DB (skip), %d to publish",
-            len(reports), already_existed, total_target,
+            "%s mirror: %d total fetched, %d already in DB (skip), %d to publish",
+            kind_label, len(items), already, total,
         )
-
-        published = 0
-        failed = 0
-        for idx, r in enumerate(to_publish, start=1):
-            rid = int(r.get("id", 0))
-            pct = (idx / total_target * 100) if total_target else 100.0
+        pub = 0
+        fail = 0
+        for idx, x in enumerate(to_pub, start=1):
+            xid = int(x.get("id", 0))
+            pct = (idx / total * 100) if total else 100.0
             try:
-                result = mirror.publish_report(r, sess)
-                published += 1
-                # Compact summary: each ratio shown only if any of that kind exists.
-                attach_parts: list[str] = []
-                img_tot = result["images_uploaded"] + result["images_failed"]
+                res = publish_fn(x, sess)
+                pub += 1
+                img_tot = res.get("images_uploaded", 0) + res.get("images_failed", 0)
+                parts = []
                 if img_tot:
-                    attach_parts.append(f"img={result['images_uploaded']}/{img_tot}")
-                vid_tot = result["videos_uploaded"] + result["videos_failed"]
+                    parts.append(f"img={res['images_uploaded']}/{img_tot}")
+                vid_tot = res.get("videos_uploaded", 0) + res.get("videos_failed", 0)
                 if vid_tot:
-                    attach_parts.append(f"vid={result['videos_uploaded']}/{vid_tot}")
-                file_tot = result["files_uploaded"] + result["files_failed"]
+                    parts.append(f"vid={res['videos_uploaded']}/{vid_tot}")
+                file_tot = res.get("files_uploaded", 0) + res.get("files_failed", 0)
                 if file_tot:
-                    attach_parts.append(f"file={result['files_uploaded']}/{file_tot}")
-                attach_str = (" " + " ".join(attach_parts)) if attach_parts else ""
+                    parts.append(f"file={res['files_uploaded']}/{file_tot}")
+                attach_str = (" " + " ".join(parts)) if parts else ""
                 _LOGGER.info(
-                    "Progress %5.1f%% (%d/%d) | Notion +1 rid=%d%s",
-                    pct, idx, total_target, rid, attach_str,
+                    "%s %5.1f%% (%d/%d) | Notion +1 id=%d%s",
+                    kind_label, pct, idx, total, xid, attach_str,
                 )
             except Exception as e:
-                failed += 1
+                fail += 1
                 _LOGGER.warning(
-                    "Progress %5.1f%% (%d/%d) | Notion FAILED rid=%d: %s",
-                    pct, idx, total_target, rid, e,
+                    "%s %5.1f%% (%d/%d) | Notion FAILED id=%d: %s",
+                    kind_label, pct, idx, total, xid, e,
                 )
         _LOGGER.info(
-            "Notion mirror DONE: %d new pages, %d already existed, %d failed",
-            published, already_existed, failed,
+            "%s mirror DONE: %d new pages, %d already existed, %d failed",
+            kind_label, pub, already, fail,
         )
+
+    # ---- Find center_id once for notice + menu sync ----
+    enr = target.get("enrollment")
+    center_id: int | None = None
+    if isinstance(enr, list) and enr:
+        center_id = enr[0].get("center_id") or enr[0].get("center")
+    elif isinstance(enr, dict):
+        center_id = enr.get("center_id") or enr.get("center")
+
+    # ---- Notion mirror: alimnota reports -----
+    if mirror is not None:
+        _publish_batch(reports, mirror.publish_report, "Report")
+
+    # ---- Notion mirror: notices (center-wide) -----
+    if mirror is not None and not args.no_notices and center_id:
+        try:
+            notices = _list_notices(sess, int(center_id))
+            if args.limit:
+                notices = notices[: args.limit]
+            _LOGGER.info("fetched %d notices for center id=%s", len(notices), center_id)
+            _publish_batch(notices, mirror.publish_notice, "Notice")
+        except Exception as e:
+            _LOGGER.warning("notice fetch failed: %s", e)
+
+    # ---- Notion mirror: albums (per child) -----
+    if mirror is not None and not args.no_albums:
+        try:
+            albums = _list_albums(sess, int(target["id"]))
+            if args.limit:
+                albums = albums[: args.limit]
+            _LOGGER.info("fetched %d albums for child id=%s", len(albums), target["id"])
+            _publish_batch(albums, mirror.publish_album, "Album")
+        except Exception as e:
+            _LOGGER.warning("album fetch failed: %s", e)
+
+    # ---- Notion mirror: daily lunch menus -----
+    if mirror is not None and not args.no_menus and center_id:
+        try:
+            menus = _list_menus(sess, int(center_id))
+            if args.limit:
+                menus = menus[: args.limit]
+            _LOGGER.info("fetched %d daily menus for center id=%s", len(menus), center_id)
+            _publish_batch(menus, mirror.publish_menu, "Menu")
+        except Exception as e:
+            _LOGGER.warning("menu fetch failed: %s", e)
 
     return 0
 

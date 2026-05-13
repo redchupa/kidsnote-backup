@@ -641,5 +641,372 @@ class NotionMirror:
             "files_failed": files_failed,
         }
 
+    # ----------------------------------------------------------- notice / album publish
+
+    def _publish_simple_item(
+        self,
+        item: dict[str, Any],
+        kidsnote_sess: requests.Session,
+        *,
+        title: str,
+        item_id: int,
+        date_str: str,
+        meta_bits: list[str],
+    ) -> dict[str, Any]:
+        """Generic publisher for items with the same shape as reports
+        (notices, albums): title/content/author/attached_images/video/files.
+
+        Uses the same upload + block-building logic as ``publish_report``.
+        """
+        # ---- Upload images ----
+        image_upload_ids: list[str] = []
+        images_failed = 0
+        for img in item.get("attached_images") or []:
+            if not isinstance(img, dict):
+                continue
+            url = (
+                img.get("original")
+                or img.get("high_resize")
+                or img.get("large")
+                or img.get("url")
+            )
+            if not url:
+                images_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=120)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("photo download failed (%s): %s", url, e)
+                images_failed += 1
+                continue
+            hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
+            fid = self._upload_one_image(raw_bytes, hint)
+            if fid:
+                image_upload_ids.append(fid)
+            else:
+                images_failed += 1
+
+        # ---- Upload videos ----
+        video_upload_ids: list[str] = []
+        videos_failed = 0
+        video_objs: list[dict[str, Any]] = []
+        for k in ("attached_video", "video", "attached_videos"):
+            v = item.get(k)
+            if isinstance(v, dict):
+                video_objs.append(v)
+                break
+            if isinstance(v, list) and v:
+                video_objs.extend(x for x in v if isinstance(x, dict))
+                break
+        for vobj in video_objs:
+            url = vobj.get("original") or vobj.get("high") or vobj.get("url")
+            if not url:
+                videos_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=180)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("video download failed (%s): %s", url, e)
+                videos_failed += 1
+                continue
+            hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
+            fid = self._upload_one_blob(raw_bytes, hint, kind="video")
+            if fid:
+                video_upload_ids.append(fid)
+            else:
+                videos_failed += 1
+
+        # ---- Upload generic files ----
+        file_upload_ids: list[tuple[str, str]] = []
+        files_failed = 0
+        for fobj in item.get("attached_files") or []:
+            if not isinstance(fobj, dict):
+                continue
+            url = fobj.get("original") or fobj.get("url")
+            if not url:
+                files_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=180)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("file download failed (%s): %s", url, e)
+                files_failed += 1
+                continue
+            hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
+            fid = self._upload_one_blob(raw_bytes, hint, kind="file")
+            if fid:
+                file_upload_ids.append((fid, hint))
+            else:
+                files_failed += 1
+
+        # ---- Build body blocks ----
+        blocks: list[dict[str, Any]] = []
+        if meta_bits:
+            blocks.append(self._para(" · ".join(meta_bits), color="gray"))
+        body_text = (item.get("content") or "").strip()
+        if body_text:
+            for chunk in self._chunk(body_text):
+                blocks.append(self._para(chunk))
+
+        if image_upload_ids:
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "사진"}}]},
+            })
+            for fid in image_upload_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "image",
+                    "image": {"type": "file_upload", "file_upload": {"id": fid}},
+                })
+        if video_upload_ids:
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "동영상"}}]},
+            })
+            for fid in video_upload_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "video",
+                    "video": {"type": "file_upload", "file_upload": {"id": fid}},
+                })
+        if file_upload_ids:
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "첨부 파일"}}]},
+            })
+            for fid, fname in file_upload_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "file",
+                    "file": {
+                        "type": "file_upload",
+                        "file_upload": {"id": fid},
+                        "name": fname[:100],
+                    },
+                })
+
+        # ---- Create page ----
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        properties: dict[str, Any] = {
+            self._prop_title: {"title": [{"text": {"content": title[:200]}}]},
+            self._prop_report_id: {"number": item_id},
+        }
+        if date_str and self._prop_date:
+            try:
+                d = datetime.fromisoformat(date_str[:10]).date().isoformat()
+                properties[self._prop_date] = {"date": {"start": d}}
+            except (ValueError, TypeError):
+                pass
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+            "children": blocks,
+        }
+        r = self.session.post(
+            f"{NOTION_API}/pages",
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        page = r.json()
+        return {
+            "page_id": page.get("id", ""),
+            "title": title,
+            "item_id": item_id,
+            "images_uploaded": len(image_upload_ids),
+            "images_failed": images_failed,
+            "videos_uploaded": len(video_upload_ids),
+            "videos_failed": videos_failed,
+            "files_uploaded": len(file_upload_ids),
+            "files_failed": files_failed,
+        }
+
+    def publish_notice(
+        self,
+        notice: dict[str, Any],
+        kidsnote_sess: requests.Session,
+    ) -> dict[str, Any]:
+        """Create a Notion page for one notice (`/centers/.../notices/`)."""
+        notice_id = int(notice["id"])
+        date_str = (
+            (notice.get("created") or "")[:10]
+            or (notice.get("modified") or "")[:10]
+            or datetime.now().date().isoformat()
+        )
+        nt = (notice.get("title") or "").strip()
+        title = f"[{date_str}] 공지: {nt}" if nt else f"[{date_str}] 공지 #{notice_id}"
+        meta_bits: list[str] = []
+        if notice.get("author_name"):
+            meta_bits.append(f"작성 {notice['author_name']}")
+        if notice.get("is_center_notice"):
+            meta_bits.append("센터 공지")
+        if notice.get("is_always_on_top"):
+            meta_bits.append("📌 상단고정")
+        if notice.get("num_comments"):
+            meta_bits.append(f"댓글 {notice['num_comments']}")
+        return self._publish_simple_item(
+            notice, kidsnote_sess,
+            title=title, item_id=notice_id, date_str=date_str,
+            meta_bits=meta_bits,
+        )
+
+    def publish_album(
+        self,
+        album: dict[str, Any],
+        kidsnote_sess: requests.Session,
+    ) -> dict[str, Any]:
+        """Create a Notion page for one album (`/children/.../albums/`)."""
+        album_id = int(album["id"])
+        date_str = (
+            (album.get("created") or "")[:10]
+            or (album.get("modified") or "")[:10]
+            or datetime.now().date().isoformat()
+        )
+        at = (album.get("title") or "").strip()
+        title = f"[{date_str}] 앨범: {at}" if at else f"[{date_str}] 앨범 #{album_id}"
+        meta_bits: list[str] = []
+        if album.get("author_name"):
+            meta_bits.append(f"작성 {album['author_name']}")
+        if album.get("num_comments"):
+            meta_bits.append(f"댓글 {album['num_comments']}")
+        return self._publish_simple_item(
+            album, kidsnote_sess,
+            title=title, item_id=album_id, date_str=date_str,
+            meta_bits=meta_bits,
+        )
+
+    # ----------------------------------------------------------- daily menu publish
+
+    # Per-meal labels for menu page body. Order matters (matches kidsnote app).
+    MEAL_FIELDS: list[tuple[str, str, str]] = [
+        ("morning", "morning_img", "🌅 아침"),
+        ("morning_snack", "morning_snack_img", "🍪 오전 간식"),
+        ("lunch", "lunch_img", "🍱 점심"),
+        ("afternoon_snack", "afternoon_snack_img", "🍰 오후 간식"),
+        ("dinner", "dinner_img", "🍚 저녁"),
+    ]
+
+    def publish_menu(
+        self,
+        menu: dict[str, Any],
+        kidsnote_sess: requests.Session,
+    ) -> dict[str, Any]:
+        """Create a Notion page for one daily lunch menu.
+
+        Page title: ``[YYYY-MM-DD] 식단표``
+        Body: per-meal heading → text (each line of the meal) → photo (if any).
+
+        Returns ``{page_id, title, menu_id, images_uploaded, images_failed}``.
+        """
+        menu_id = int(menu["id"])
+        date_str = menu.get("date_menu") or (menu.get("modified") or "")[:10]
+        title = f"[{date_str}] 식단표"
+
+        # Build body + upload meal photos (each meal has at most 1 image).
+        blocks: list[dict[str, Any]] = []
+        images_uploaded = 0
+        images_failed = 0
+
+        meta_bits: list[str] = []
+        if menu.get("author_name"):
+            meta_bits.append(f"작성 {menu['author_name']}")
+        if menu.get("date_menu"):
+            meta_bits.append(f"날짜 {menu['date_menu']}")
+        if meta_bits:
+            blocks.append(self._para(" · ".join(meta_bits), color="gray"))
+
+        for text_field, img_field, label in self.MEAL_FIELDS:
+            meal_text = (menu.get(text_field) or "").strip()
+            meal_img = menu.get(img_field)
+            if not meal_text and not isinstance(meal_img, dict):
+                continue  # skip empty meal slot
+
+            # Heading per meal
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": label}}]},
+            })
+
+            # Each newline in the menu text → separate paragraph
+            for line in meal_text.split("\n"):
+                line = line.strip()
+                if line:
+                    blocks.append(self._para(line))
+
+            # Photo (if present)
+            if isinstance(meal_img, dict):
+                url = meal_img.get("original") or meal_img.get("large") or meal_img.get("url")
+                if url:
+                    try:
+                        resp = kidsnote_sess.get(url, timeout=120)
+                        resp.raise_for_status()
+                        raw = resp.content
+                        hint = meal_img.get("original_file_name") or f"menu_{menu_id}_{text_field}.jpg"
+                        fid = self._upload_one_image(raw, hint)
+                        if fid:
+                            blocks.append({
+                                "object": "block",
+                                "type": "image",
+                                "image": {
+                                    "type": "file_upload",
+                                    "file_upload": {"id": fid},
+                                },
+                            })
+                            images_uploaded += 1
+                        else:
+                            images_failed += 1
+                    except Exception as e:
+                        _LOGGER.warning("menu photo download failed (%s): %s", url, e)
+                        images_failed += 1
+
+        # Resolve property names + assemble payload.
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        properties: dict[str, Any] = {
+            self._prop_title: {"title": [{"text": {"content": title[:200]}}]},
+            self._prop_report_id: {"number": menu_id},
+        }
+        if date_str and self._prop_date:
+            try:
+                d = datetime.fromisoformat(date_str[:10]).date().isoformat()
+                properties[self._prop_date] = {"date": {"start": d}}
+            except (ValueError, TypeError):
+                pass
+
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+            "children": blocks,
+        }
+        r = self.session.post(
+            f"{NOTION_API}/pages",
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        page = r.json()
+        return {
+            "page_id": page.get("id", ""),
+            "page_url": page.get("url", ""),
+            "menu_id": menu_id,
+            "title": title,
+            "images_uploaded": images_uploaded,
+            "images_failed": images_failed,
+        }
+
 
 __all__ = ["NotionMirror", "DEFAULT_MAX_IMAGE_BYTES"]
