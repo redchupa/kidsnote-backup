@@ -779,6 +779,111 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             _LOGGER.warning("dashboard publish failed: %s", e)
 
+    # ---- 📅 오늘의 추억 (Phase 2) ----
+    if mirror is not None:
+        from datetime import datetime as _dt
+        today = _dt.now().date()
+        today_md = today.strftime("%m-%d")
+        memories_by_year: dict[int, list[dict[str, Any]]] = {}
+
+        # Query the entire Notion DB once to find same-MM-DD alimnota
+        # pages from prior years.
+        try:
+            cur: str | None = None
+            while True:
+                body: dict[str, Any] = {"page_size": 100}
+                if cur:
+                    body["start_cursor"] = cur
+                rq = mirror.session.post(
+                    f"https://api.notion.com/v1/databases/{mirror.database_id}/query",
+                    headers=mirror._headers(),
+                    json=body,
+                    timeout=mirror.timeout,
+                )
+                rq.raise_for_status()
+                data = rq.json()
+                for page in data.get("results") or []:
+                    props = page.get("properties") or {}
+                    # Look up date + title + report_id by their resolved names
+                    if not mirror._prop_date or not mirror._prop_title or not mirror._prop_report_id:
+                        continue
+                    rid_obj = (props.get(mirror._prop_report_id) or {})
+                    rid = rid_obj.get("number")
+                    if rid is None or rid < 0:
+                        continue  # skip system pages (dashboard / memories / nutrition)
+                    date_obj = (props.get(mirror._prop_date) or {}).get("date") or {}
+                    page_date = date_obj.get("start") or ""
+                    if not page_date or len(page_date) < 10:
+                        continue
+                    if page_date[5:10] != today_md:
+                        continue
+                    year = int(page_date[:4])
+                    if year == today.year:
+                        continue  # skip today's own
+                    title_rt = (props.get(mirror._prop_title) or {}).get("title") or []
+                    title_text = "".join(seg.get("plain_text", "") for seg in title_rt)
+                    memories_by_year.setdefault(year, []).append({
+                        "notion_page_id": page["id"],
+                        "notion_title": title_text,
+                        "date_written": page_date,
+                    })
+                if not data.get("has_more"):
+                    break
+                cur = data.get("next_cursor")
+        except Exception as e:
+            _LOGGER.warning("memories query failed: %s", e)
+
+        try:
+            mirror.publish_memories(today.isoformat(), memories_by_year)
+            n = sum(len(v) for v in memories_by_year.values())
+            _LOGGER.info("📅 Memories page updated (%d entries across %d year(s))",
+                         n, len(memories_by_year))
+        except Exception as e:
+            _LOGGER.warning("memories publish failed: %s", e)
+
+    # ---- 🥗 영양 분석 (Phase 3) ----
+    if mirror is not None and menus_fetched:
+        from collections import Counter as _Counter, defaultdict as _defaultdict
+        from notion_mirror import NUTRITION_GROUPS
+
+        group_counter: _Counter[str] = _Counter()
+        monthly_group: dict[str, _Counter[str]] = _defaultdict(_Counter)
+        item_counter: _Counter[str] = _Counter()
+
+        for menu in menus_fetched:
+            ym = (menu.get("date_menu") or "")[:7]
+            full_text_parts = []
+            for fld in ("morning", "morning_snack", "lunch", "afternoon_snack", "dinner"):
+                txt = menu.get(fld) or ""
+                if txt.strip():
+                    full_text_parts.append(txt)
+            full_text = "\n".join(full_text_parts)
+            for line in full_text.split("\n"):
+                item = line.strip()
+                if not item:
+                    continue
+                item_counter[item] += 1
+                for group, keywords in NUTRITION_GROUPS:
+                    for kw in keywords:
+                        if kw in item:
+                            group_counter[group] += 1
+                            if ym:
+                                monthly_group[ym][group] += 1
+                            break
+
+        nutrition_stats = {
+            "menus_total": len(menus_fetched),
+            "nutrition_group_counts": dict(group_counter),
+            "nutrition_monthly": {ym: dict(c) for ym, c in monthly_group.items()},
+            "top_menu_items": item_counter.most_common(15),
+        }
+        try:
+            mirror.publish_nutrition(nutrition_stats)
+            _LOGGER.info("🥗 Nutrition page updated (%d distinct menu items, %d groups)",
+                         len(item_counter), len(group_counter))
+        except Exception as e:
+            _LOGGER.warning("nutrition publish failed: %s", e)
+
     return 0
 
 

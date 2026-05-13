@@ -1702,13 +1702,17 @@ class NotionMirror:
 
     # ----------------------------------------------------------- stats dashboard
 
-    # Pinned report id used so the dashboard page lives inside the DB
-    # but never collides with a real kidsnote alimnota (positive 1e9 ids).
+    # Pinned Report IDs for singleton system pages (kidsnote ids are
+    # all positive 1e9+, so any negative number is safe).
     DASHBOARD_REPORT_ID = -1
     DASHBOARD_TITLE = "📊 통계 대시보드"
+    MEMORIES_REPORT_ID = -2
+    MEMORIES_TITLE = "📅 오늘의 추억"
+    NUTRITION_REPORT_ID = -3
+    NUTRITION_TITLE = "🥗 영양 분석"
 
-    def _find_dashboard_page(self) -> str | None:
-        """Locate the existing dashboard page by its sentinel Report ID."""
+    def _find_singleton_page(self, sentinel_report_id: int) -> str | None:
+        """Locate an existing system singleton page by its sentinel Report ID."""
         self._resolve_schema()
         assert self._prop_report_id is not None
         try:
@@ -1718,7 +1722,7 @@ class NotionMirror:
                 json={
                     "filter": {
                         "property": self._prop_report_id,
-                        "number": {"equals": self.DASHBOARD_REPORT_ID},
+                        "number": {"equals": sentinel_report_id},
                     },
                     "page_size": 1,
                 },
@@ -1728,8 +1732,11 @@ class NotionMirror:
             results = r.json().get("results") or []
             return results[0]["id"] if results else None
         except Exception as e:
-            _LOGGER.warning("dashboard lookup failed: %s", e)
+            _LOGGER.warning("singleton lookup failed (rid=%d): %s", sentinel_report_id, e)
             return None
+
+    def _find_dashboard_page(self) -> str | None:
+        return self._find_singleton_page(self.DASHBOARD_REPORT_ID)
 
     def _archive_page(self, page_id: str) -> None:
         try:
@@ -1909,6 +1916,295 @@ class NotionMirror:
                 })
 
         return blocks
+
+
+    # ----------------------------------------------------------- "오늘의 추억"
+
+    def publish_memories(
+        self,
+        today_iso: str,
+        memories_by_year: dict[int, list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        """Replace the singleton ``📅 오늘의 추억`` page with same-day alimnota
+        from previous years.
+
+        ``memories_by_year`` keys are year integers (e.g. 2025), values are
+        lists of report dicts with at least {id, date_written, content,
+        author_name, author.type}. When empty (no prior data), the page is
+        still refreshed with an explanatory message.
+        """
+        existing = self._find_singleton_page(self.MEMORIES_REPORT_ID)
+        if existing:
+            self._archive_page(existing)
+
+        blocks: list[dict[str, Any]] = []
+        # Header callout
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": f"오늘 ({today_iso})에 작년·재작년 같은 날에 있었던 알림장입니다.\n"
+                                "이 페이지를 모바일 노션 앱에 즐겨찾기해두면 매일 자동으로 갱신됩니다.",
+                }}],
+                "icon": {"type": "emoji", "emoji": "📅"},
+                "color": "yellow_background",
+            },
+        })
+
+        if not memories_by_year:
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{
+                    "type": "text",
+                    "text": {"content": "작년 이 날짜에는 백업된 알림장이 없습니다. 1년 후에 다시 와주세요!"},
+                }]},
+            })
+        else:
+            # Group by year descending (most recent year first)
+            for year in sorted(memories_by_year.keys(), reverse=True):
+                items = memories_by_year[year]
+                if not items:
+                    continue
+                blocks.append({
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {"rich_text": [{
+                        "type": "text",
+                        "text": {"content": f"📅 {year}년 같은 날"},
+                    }]},
+                })
+                for it in items:
+                    page_id = it.get("notion_page_id")
+                    title = it.get("notion_title") or it.get("date_written") or ""
+                    if page_id:
+                        # Notion page mention — title auto-rendered + clickable
+                        blocks.append({
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {"rich_text": [{
+                                "type": "mention",
+                                "mention": {"type": "page", "page": {"id": page_id}},
+                            }]},
+                        })
+                    else:
+                        # Fallback: plain text with title
+                        blocks.append({
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {"rich_text": [{
+                                "type": "text",
+                                "text": {"content": title},
+                            }]},
+                        })
+
+        # Build properties + create page
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        properties: dict[str, Any] = {
+            self._prop_title: {
+                "title": [{"text": {"content": self.MEMORIES_TITLE}}],
+            },
+            self._prop_report_id: {"number": self.MEMORIES_REPORT_ID},
+        }
+        if self._prop_date:
+            properties[self._prop_date] = {
+                "date": {"start": datetime.now().date().isoformat()},
+            }
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+            "children": blocks,
+        }
+        try:
+            r = self.session.post(
+                f"{NOTION_API}/pages",
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            _LOGGER.warning("memories publish failed: %s", e)
+            return None
+
+    # ----------------------------------------------------------- 영양 분석
+
+    def publish_nutrition(self, stats: dict[str, Any]) -> dict[str, Any] | None:
+        """Replace the singleton ``🥗 영양 분석`` page with menu nutrition breakdown."""
+        existing = self._find_singleton_page(self.NUTRITION_REPORT_ID)
+        if existing:
+            self._archive_page(existing)
+
+        blocks = self._build_nutrition_blocks(stats)
+        self._resolve_schema()
+        assert self._prop_title is not None and self._prop_report_id is not None
+        properties: dict[str, Any] = {
+            self._prop_title: {
+                "title": [{"text": {"content": self.NUTRITION_TITLE}}],
+            },
+            self._prop_report_id: {"number": self.NUTRITION_REPORT_ID},
+        }
+        if self._prop_date:
+            properties[self._prop_date] = {
+                "date": {"start": datetime.now().date().isoformat()},
+            }
+        payload = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+            "children": blocks,
+        }
+        try:
+            r = self.session.post(
+                f"{NOTION_API}/pages",
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            _LOGGER.warning("nutrition publish failed: %s", e)
+            return None
+
+    def _build_nutrition_blocks(self, stats: dict[str, Any]) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+
+        last_refreshed = datetime.now().strftime("%Y-%m-%d %H:%M")
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": (
+                        f"마지막 갱신: {last_refreshed}\n"
+                        f"분석 대상: 식단 {stats.get('menus_total', 0)}일치\n"
+                        f"식단표 메뉴 텍스트를 분류해서 영양 그룹별 등장 빈도를 보여줍니다."
+                    ),
+                }}],
+                "icon": {"type": "emoji", "emoji": "🥗"},
+                "color": "green_background",
+            },
+        })
+
+        # 영양 그룹별 비율 (pie)
+        group_counts = stats.get("nutrition_group_counts") or {}
+        if group_counts:
+            blocks.append(self._h2("🥗 영양 그룹 비율 (전체 기간)"))
+            mer = ["pie title 영양 그룹"]
+            for label, n in sorted(group_counts.items(), key=lambda kv: kv[1], reverse=True):
+                mer.append(f'  "{label}" : {n}')
+            blocks.append(self._mermaid_block("\n".join(mer)))
+
+        # 월별 영양 그룹 분포 (table)
+        monthly_group = stats.get("nutrition_monthly") or {}
+        if monthly_group:
+            blocks.append(self._h2("📅 월별 영양 그룹 분포"))
+            groups = sorted({g for m in monthly_group.values() for g in m})
+            header = "| 월 | " + " | ".join(groups) + " |"
+            sep = "|" + "---|" * (len(groups) + 1)
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": header}}]},
+            })
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": sep}}]},
+            })
+            for m in sorted(monthly_group.keys()):
+                row = "| " + m + " | " + " | ".join(str(monthly_group[m].get(g, 0)) for g in groups) + " |"
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": row}}]},
+                })
+
+        # TOP 메뉴 (the most frequently served items)
+        top_menus = stats.get("top_menu_items") or []
+        if top_menus:
+            blocks.append(self._h2("🍱 가장 자주 나온 메뉴 TOP 15"))
+            for name, count in top_menus[:15]:
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{
+                        "type": "text",
+                        "text": {"content": f"• {name} — {count}회"},
+                    }]},
+                })
+
+        # Footer disclaimer
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {
+                    "content": (
+                        "ℹ️ 영양 그룹은 메뉴명 키워드 매칭(rule-based) 기준이며, "
+                        "정확한 칼로리·영양소 분석은 아닙니다. "
+                        "식단 균형의 큰 그림만 보세요."
+                    ),
+                }}],
+                "icon": {"type": "emoji", "emoji": "ℹ️"},
+                "color": "gray_background",
+            },
+        })
+        return blocks
+
+
+# Static nutrition group dictionary — keyword-based classification of
+# daycare lunch menu items. Order doesn't matter; multiple groups can fire
+# for one menu (e.g. ``계란찜`` → 단백질 / ``콩나물`` → 채소).
+NUTRITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("🥩 단백질", (
+        "고기", "소고기", "돼지고기", "닭고기", "오리", "한우",
+        "불고기", "갈비", "제육", "삼겹", "장조림", "동그랑땡",
+        "햄", "소시지", "햄버그", "미트볼", "스테이크", "찜닭",
+        "계란", "달걀", "계란찜", "달걀찜", "오믈렛", "스크램블",
+        "두부", "콩", "콩나물", "콩고기", "유부",
+        "생선", "고등어", "갈치", "삼치", "동태", "조기", "참치", "연어",
+        "오징어", "새우", "굴", "조개", "꽁치",
+    )),
+    ("🌾 탄수화물", (
+        "밥", "쌀밥", "잡곡밥", "현미밥", "보리밥", "콩밥", "팥밥",
+        "비빔밥", "주먹밥", "볶음밥", "오므라이스",
+        "면", "국수", "라면", "우동", "잔치국수", "스파게티", "파스타",
+        "빵", "토스트", "샌드위치", "햄버거빵",
+        "떡", "떡국", "송편", "찰떡", "인절미", "백설기",
+        "감자", "고구마", "옥수수",
+    )),
+    ("🥬 채소", (
+        "김치", "배추김치", "깍두기", "총각김치", "물김치",
+        "나물", "시금치", "콩나물", "숙주", "고사리", "도라지",
+        "오이", "당근", "양파", "마늘", "파", "상추", "양배추",
+        "배추", "무", "샐러드", "샐러리",
+        "브로콜리", "버섯", "팽이", "송이",
+        "쌈", "쌈장",
+    )),
+    ("🍅 과일", (
+        "과일", "사과", "배", "딸기", "포도", "감", "귤", "오렌지",
+        "키위", "바나나", "참외", "수박", "복숭아", "자두", "체리",
+        "블루베리", "토마토", "방울토마토", "파인애플", "망고",
+    )),
+    ("🥛 유제품", (
+        "우유", "두유", "요거트", "요구르트", "치즈", "버터",
+        "크림", "아이스크림",
+    )),
+    ("🍲 국·찌개·수프", (
+        "국", "탕", "찌개", "전골", "스튜", "수프", "포타지",
+        "된장국", "미역국", "콩나물국", "북엇국", "감자국",
+        "김치찌개", "된장찌개", "부대찌개", "순두부",
+    )),
+    ("🍩 간식·디저트", (
+        "쿠키", "케이크", "젤리", "푸딩", "초콜릿", "사탕",
+        "파이", "와플", "팬케이크", "약과", "한과", "꿀떡",
+        "과자", "비스킷", "타르트",
+    )),
+)
 
 
 __all__ = ["NotionMirror", "DEFAULT_MAX_IMAGE_BYTES"]
