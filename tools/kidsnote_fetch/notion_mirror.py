@@ -23,7 +23,9 @@ Privacy guards:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -526,18 +528,42 @@ class NotionMirror:
 
     # ----------------------------------------------------------- publish
 
-    @staticmethod
-    def _summarize_text(text: str, max_chars: int = 70) -> str:
+    # Common Korean greeting prefixes that drown out the real content of an
+    # alimnota when used naïvely as the page title. The script strips a
+    # leading greeting *sentence* — not just the word — so the next sentence
+    # (which usually contains the day's actual activity) becomes the title.
+    _GREETING_PATTERNS = (
+        re.compile(r"^안녕하세[요시는유]+[^.!?~♡^]*[.!?~♡^]+\s*"),
+        re.compile(r"^어머[니님][^.!?~♡^]*[.!?~♡^]+\s*"),
+        re.compile(r"^아버[지님][^.!?~♡^]*[.!?~♡^]+\s*"),
+        re.compile(r"^부모[님]?[^.!?~♡^]*[.!?~♡^]+\s*"),
+    )
+
+    @classmethod
+    def _summarize_text(cls, text: str, max_chars: int = 100) -> str:
         """Pick a readable one-line summary out of an alimnota body.
 
         Strategy:
-        1. Strip / flatten whitespace.
-        2. Try to cut at the first sentence terminator (Korean and Latin).
-        3. Otherwise hard-truncate at ``max_chars`` and append an ellipsis.
+        1. Strip leading greeting sentence (``안녕하세요 어머님~`` etc) so the
+           summary lands on the meaningful first sentence about the day.
+        2. Collapse internal whitespace.
+        3. Cut at the first sentence terminator (Korean ``다./요.`` and Latin).
+        4. Hard-truncate at ``max_chars`` + ellipsis when no sentence end
+           lies within that range.
         """
         if not text:
             return ""
-        flat = " ".join(text.split())  # collapse all whitespace
+        flat = " ".join(text.split())
+        # Strip up to 2 greeting sentences in a row ("안녕하세요. 어머니~").
+        for _ in range(2):
+            for pat in cls._GREETING_PATTERNS:
+                m = pat.match(flat)
+                if m:
+                    flat = flat[m.end():].lstrip()
+                    break
+            else:
+                break
+
         for delim in ("다. ", "요. ", "다.", "요.", ".", "!", "?", "♡"):
             idx = flat.find(delim)
             if 10 < idx < max_chars:
