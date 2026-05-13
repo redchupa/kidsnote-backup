@@ -697,23 +697,31 @@ class NotionMirror:
 
         return out
 
-    def _menu_summary_blocks(self, menu: dict[str, Any]) -> list[dict[str, Any]]:
-        """Compact text-only summary of a daily menu for inline embedding
-        inside a report page. Photos of food are intentionally omitted to
-        keep report pages from doubling in size — full menu (with photos)
-        is still available as a separate menu page if the matching date
-        has no report.
+    def _menu_summary_blocks(
+        self,
+        menu: dict[str, Any],
+        kidsnote_sess: requests.Session | None = None,
+    ) -> list[dict[str, Any]]:
+        """Inline daily menu (heading + text + photo per meal) for embedding
+        inside a report page.
+
+        If ``kidsnote_sess`` is provided, each meal's photo (when present) is
+        downloaded and uploaded to Notion, then embedded as an image block
+        right after the meal text. Without a session, only the text is shown.
         """
         out: list[dict[str, Any]] = [{
             "object": "block",
             "type": "heading_3",
             "heading_3": {"rich_text": [{"type": "text", "text": {"content": "🍱 오늘의 식단"}}]},
         }]
-        for text_field, _img_field, label in self.MEAL_FIELDS:
+        for text_field, img_field, label in self.MEAL_FIELDS:
             text = (menu.get(text_field) or "").strip()
-            if not text:
+            img = menu.get(img_field)
+            if not text and not isinstance(img, dict):
                 continue
-            one_line = " · ".join(p for p in text.split("\n") if p.strip())
+
+            # Meal heading line: "🍱 점심: 잔치국수 · 김치"
+            one_line = " · ".join(p for p in text.split("\n") if p.strip()) if text else ""
             out.append({
                 "object": "block",
                 "type": "paragraph",
@@ -722,6 +730,97 @@ class NotionMirror:
                     {"type": "text", "text": {"content": one_line}},
                 ]},
             })
+
+            # Meal photo (if any + session available)
+            if kidsnote_sess is None or not isinstance(img, dict):
+                continue
+            url = img.get("original") or img.get("large") or img.get("url")
+            if not url:
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=120)
+                resp.raise_for_status()
+                raw = resp.content
+            except Exception as e:
+                _LOGGER.warning("menu photo download failed (%s): %s", url, e)
+                continue
+            hint = img.get("original_file_name") or f"menu_{text_field}.jpg"
+            fid = self._upload_one_image(raw, hint)
+            if fid:
+                out.append({
+                    "object": "block",
+                    "type": "image",
+                    "image": {"type": "file_upload", "file_upload": {"id": fid}},
+                })
+        return out
+
+    @staticmethod
+    def _fetch_comments(
+        kidsnote_sess: requests.Session,
+        kind: str,
+        item_id: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch parent + teacher comments on a report/notice/album.
+
+        Confirmed live on 2026-05-13:
+            GET /api/v1/reports/<id>/comments/
+            GET /api/v1/notices/<id>/comments/
+            GET /api/v1/albums/<id>/comments/  (same pattern)
+
+        Returns empty list on any error so callers don't have to special-case.
+        """
+        try:
+            r = kidsnote_sess.get(
+                f"https://www.kidsnote.com/api/v1/{kind}/{item_id}/comments/",
+                timeout=15,
+            )
+            if r.status_code != 200:
+                return []
+            return r.json().get("results") or []
+        except Exception:
+            return []
+
+    def _comment_blocks(self, comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Render a list of comments as a Notion heading + paragraphs.
+
+        Each comment becomes:
+          - one bold gray line:  👩‍🏫 작성자 · 2026-05-12
+          - body text (chunked if long)
+
+        author.type=='teacher' → 👩‍🏫,  parent → 👨‍👩‍👧.
+        """
+        if not comments:
+            return []
+        out: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": [{
+                "type": "text",
+                "text": {"content": f"💬 댓글 ({len(comments)})"},
+            }]},
+        }]
+        for c in comments:
+            author = c.get("author") or {}
+            atype = author.get("type") or ""
+            prefix = {"teacher": "👩‍🏫", "parent": "👨‍👩‍👧", "admin": "🏫"}.get(atype, "")
+            name = c.get("author_name") or author.get("name") or "?"
+            created = (c.get("created") or "")[:10]
+            head = f"{prefix} {name} · {created}".strip()
+            out.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{
+                    "type": "text",
+                    "text": {"content": head},
+                    "annotations": {"color": "gray", "bold": True},
+                }]},
+            })
+            content = (c.get("content") or "").strip()
+            if not content and c.get("emoticon_content"):
+                content = "[이모티콘]"
+            if content:
+                for chunk in self._chunk(content):
+                    out.append(self._para(chunk))
         return out
 
     def publish_report(
@@ -866,7 +965,8 @@ class NotionMirror:
         extras: list[dict[str, Any]] = []
         extras.extend(self._life_record_detail_blocks(report))
         if attached_menu:
-            extras.extend(self._menu_summary_blocks(attached_menu))
+            # Pass session so meal photos get downloaded + uploaded inline.
+            extras.extend(self._menu_summary_blocks(attached_menu, kidsnote_sess))
         if extras:
             insert_idx = len(children)
             attachment_headings = {"사진", "동영상", "첨부 파일"}
@@ -877,6 +977,11 @@ class NotionMirror:
                         insert_idx = i
                         break
             children = children[:insert_idx] + extras + children[insert_idx:]
+
+        # Append comments (parent + teacher replies) at the very end.
+        if report.get("num_comments"):
+            comments = self._fetch_comments(kidsnote_sess, "reports", report_id)
+            children.extend(self._comment_blocks(comments))
 
         # Resolve property names on first publish (cached for subsequent calls).
         self._resolve_schema()
@@ -930,11 +1035,13 @@ class NotionMirror:
         item_id: int,
         date_str: str,
         meta_bits: list[str],
+        comment_kind: str | None = None,  # "notices" / "albums"; None = skip comments
     ) -> dict[str, Any]:
         """Generic publisher for items with the same shape as reports
         (notices, albums): title/content/author/attached_images/video/files.
 
         Uses the same upload + block-building logic as ``publish_report``.
+        ``comment_kind``: URL segment for the comments endpoint (notices/albums).
         """
         # ---- Upload images ----
         image_upload_ids: list[str] = []
@@ -1073,6 +1180,11 @@ class NotionMirror:
                     },
                 })
 
+        # ---- Append comments (parent + teacher replies) at the end ----
+        if comment_kind and item.get("num_comments"):
+            comments = self._fetch_comments(kidsnote_sess, comment_kind, item_id)
+            blocks.extend(self._comment_blocks(comments))
+
         # ---- Create page ----
         self._resolve_schema()
         assert self._prop_title is not None and self._prop_report_id is not None
@@ -1137,7 +1249,7 @@ class NotionMirror:
         return self._publish_simple_item(
             notice, kidsnote_sess,
             title=title, item_id=notice_id, date_str=date_str,
-            meta_bits=meta_bits,
+            meta_bits=meta_bits, comment_kind="notices",
         )
 
     def publish_album(
@@ -1162,7 +1274,7 @@ class NotionMirror:
         return self._publish_simple_item(
             album, kidsnote_sess,
             title=title, item_id=album_id, date_str=date_str,
-            meta_bits=meta_bits,
+            meta_bits=meta_bits, comment_kind="albums",
         )
 
     # ----------------------------------------------------------- daily menu publish

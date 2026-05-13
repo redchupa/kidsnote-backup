@@ -149,6 +149,31 @@ def _list_reports(
     return body.get("results") or body.get("reports") or []
 
 
+def _list_comments(
+    sess: requests.Session, kind: str, item_id: int
+) -> list[dict[str, Any]]:
+    """Comments for a report / notice / album.
+
+    Confirmed live on 2026-05-13:
+        GET /api/v1/reports/<id>/comments/
+        GET /api/v1/notices/<id>/comments/
+        GET /api/v1/albums/<id>/comments/  (assumed, same pattern)
+
+    `kind` is the URL segment: ``reports`` / ``notices`` / ``albums``.
+    Returns empty list on any error so the caller doesn't have to special-case.
+    """
+    try:
+        r = sess.get(
+            f"{KIDSNOTE_BASE}/api/v1/{kind}/{item_id}/comments/",
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        return r.json().get("results") or []
+    except Exception:
+        return []
+
+
 def _fetch_report_detail(
     sess: requests.Session, report_id: int
 ) -> dict[str, Any] | None:
@@ -619,11 +644,17 @@ def main(argv: list[str] | None = None) -> int:
         def _publish_report_enriched(report: dict[str, Any], sess_: requests.Session) -> dict[str, Any]:
             # 1) Enrich with detail fields (meal_status, sleep_hour, etc).
             detail = _fetch_report_detail(sess_, int(report["id"])) or report
-            # 2) Find same-day menu (if any) and remove from standalone pool.
+            # 2) Same-day menu is only embedded into TEACHER posts (alimnota
+            #    from the daycare). Parent-written entries describe what the
+            #    family did at home, so attaching the daycare menu there is
+            #    nonsensical.
+            author_type = (detail.get("author") or {}).get("type") or ""
             date_w = detail.get("date_written")
-            attached_menu = menus_for_match.get(date_w) if date_w else None
-            if attached_menu:
-                matched_menu_ids.add(int(attached_menu["id"]))
+            attached_menu = None
+            if author_type == "teacher" and date_w:
+                attached_menu = menus_for_match.get(date_w)
+                if attached_menu:
+                    matched_menu_ids.add(int(attached_menu["id"]))
             return mirror.publish_report(detail, sess_, attached_menu=attached_menu)
 
         _publish_batch(reports, _publish_report_enriched, "Report")
