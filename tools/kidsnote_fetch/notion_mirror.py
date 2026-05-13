@@ -1066,31 +1066,38 @@ class NotionMirror:
             or (report.get("created") or "")[:10]
             or datetime.now().date().isoformat()
         )
-        # Title: prefix with author-role emoji + activity category labels.
-        # Categories are matched against a curated keyword dictionary
-        # (ACTIVITY_CATEGORIES). When no category matches, fall back to
-        # the heuristic keyword extractor; if even that's empty, use the
-        # generic ``알림장 #ID`` form.
+        # Title parts (built in order):
+        #   [date]  author_icon  weather_emoji?  activity_labels_or_summary
+        # Each piece appears only when meaningful.
         author_type = (report.get("author") or {}).get("type") or ""
         author_icon = {
             "teacher": "👩‍🏫",
             "parent": "👨‍👩‍👧",
             "admin": "🏫",
         }.get(author_type, "📝")
+
+        # Weather: extract leading emoji from the localized form
+        # (e.g. ``⛅ 구름 조금`` → ``⛅``) so the title stays compact.
+        w_code = report.get("weather")
+        w_emoji = ""
+        if w_code:
+            w_display = WEATHER_KO.get(w_code, "")
+            if w_display:
+                w_emoji = w_display.split()[0]
+
         body_text = report.get("content") or ""
         categories = self._classify_categories(body_text)
         if categories:
-            label = " · ".join(categories)
-            title = f"[{date_str}] {author_icon} {label}"
+            tail = " · ".join(categories)
         else:
             # Fallback to keyword summary, then to a fixed label.
             cname = report.get("child_name") or ""
             stripped = body_text.replace(cname, "") if cname else body_text
             summary = self._summarize_text(stripped)
-            if summary:
-                title = f"[{date_str}] {author_icon} {summary}"
-            else:
-                title = f"[{date_str}] {author_icon} 알림장 #{report_id}"
+            tail = summary or f"알림장 #{report_id}"
+
+        prefix_emojis = author_icon + (f" {w_emoji}" if w_emoji else "")
+        title = f"[{date_str}] {prefix_emojis} {tail}"
 
         # Upload photos first so we can drop image blocks into the page body.
         image_upload_ids: list[str] = []
