@@ -566,11 +566,13 @@ def main(argv: list[str] | None = None) -> int:
     if mirror is not None and reports:
         _LOGGER.info("enriching %d reports with detail API...", len(reports))
         enriched: list[dict[str, Any]] = []
-        for r in reports:
+        for i, r in enumerate(reports, 1):
             d = _fetch_report_detail(sess, int(r["id"])) or r
             enriched.append(d)
+            if i % 5 == 0 or i == len(reports):
+                _LOGGER.info("  detail enrich %d/%d done", i, len(reports))
         reports = enriched
-        _LOGGER.info("detail enrich done")
+        _LOGGER.info("detail enrich complete")
 
     # ---- local save (optional) -----
     total_new_files = 0
