@@ -599,9 +599,10 @@ def main(argv: list[str] | None = None) -> int:
     menus_fetched: list[dict[str, Any]] = []
     if mirror is not None and not args.no_menus and center_id:
         try:
+            # Always fetch the full menu set for date-matching, regardless
+            # of --limit (otherwise a small limit could leave reports
+            # without their same-day menu attached).
             menus_fetched = _list_menus(sess, int(center_id))
-            if args.limit:
-                menus_fetched = menus_fetched[: args.limit * 3]
             for m in menus_fetched:
                 d = m.get("date_menu")
                 if d:
