@@ -211,36 +211,60 @@ def _list_menus(
 
 
 def _list_paginated(
-    sess: requests.Session, url: str, page_size: int = 100, max_pages: int = 200
+    sess: requests.Session, url: str, page_size: int = 100, max_pages: int = 30
 ) -> list[dict[str, Any]]:
     """Walk a cursor-paginated DRF endpoint until exhausted.
 
-    Some kidsnote endpoints (notices, albums) use cursor-style pagination
-    where `next` is either a full URL or a base64 token. This helper
-    handles both forms and aggregates results.
+    Defensive against:
+    - Cursor cycles (kidsnote occasionally returns a cursor that loops back to
+      data it already gave us → infinite pagination with duplicate results).
+    - Buggy ``next`` tokens that never become None.
+
+    Stops when (a) ``next`` is None, (b) we've already seen the cursor, or
+    (c) we hit ``max_pages``. Duplicate ids inside results are also
+    deduped on output.
     """
     out: list[dict[str, Any]] = []
+    seen_ids: set[Any] = set()
+    seen_cursors: set[str] = set()
     next_url: str | None = url
     pages = 0
     while next_url and pages < max_pages:
         sep = "&" if "?" in next_url else "?"
-        # If next_url already has page_size we don't re-add it.
         if "page_size=" not in next_url:
             next_url = f"{next_url}{sep}page_size={page_size}"
         r = sess.get(next_url, timeout=60)
         r.raise_for_status()
         body = r.json()
-        out.extend(body.get("results") or [])
+        results = body.get("results") or []
+        # Dedup by id (kidsnote cursor sometimes returns overlap)
+        new_in_page = 0
+        for item in results:
+            iid = item.get("id")
+            if iid is not None and iid in seen_ids:
+                continue
+            if iid is not None:
+                seen_ids.add(iid)
+            out.append(item)
+            new_in_page += 1
         nxt = body.get("next")
         if not nxt:
+            break
+        if nxt in seen_cursors:
+            _LOGGER.info("pagination: cursor cycle detected after %d pages, stopping", pages + 1)
+            break
+        seen_cursors.add(nxt)
+        if new_in_page == 0:
+            _LOGGER.info("pagination: 0 new items in page %d, stopping", pages + 1)
             break
         if nxt.startswith("http"):
             next_url = nxt
         else:
-            # bare cursor token — append to original endpoint
             base = url.split("?")[0]
             next_url = f"{base}?page_size={page_size}&cursor={nxt}"
         pages += 1
+    if pages >= max_pages:
+        _LOGGER.warning("pagination: hit max_pages=%d (%d items so far)", max_pages, len(out))
     return out
 
 
