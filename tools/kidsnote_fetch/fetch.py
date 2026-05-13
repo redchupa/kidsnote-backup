@@ -726,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 📊 Stats dashboard ----
     if mirror is not None and reports:
+        _LOGGER.info("📊 Dashboard: computing stats from %d reports...", len(reports))
         from collections import Counter
         from notion_mirror import NotionMirror
 
@@ -785,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
         today = _dt.now().date()
         today_md = today.strftime("%m-%d")
         memories_by_year: dict[int, list[dict[str, Any]]] = {}
+        _LOGGER.info("📅 Memories: scanning Notion DB for same-day (%s) pages...", today_md)
 
         # Query the entire Notion DB once to find same-MM-DD alimnota
         # pages from prior years.
@@ -843,6 +845,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 🥗 영양 분석 (Phase 3) ----
     if mirror is not None and menus_fetched:
+        _LOGGER.info("🥗 Nutrition: analyzing %d menus...", len(menus_fetched))
         from collections import Counter as _Counter, defaultdict as _defaultdict
         from notion_mirror import NUTRITION_GROUPS
 
