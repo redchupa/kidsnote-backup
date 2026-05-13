@@ -681,17 +681,14 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             _LOGGER.warning("album fetch failed: %s", e)
 
-    # ---- Notion mirror: daily lunch menus (only those NOT matched into a report) -----
-    if mirror is not None and not args.no_menus and center_id and menus_fetched:
-        # Skip menus that were already embedded into a same-day report.
-        standalone_menus = [m for m in menus_fetched if int(m["id"]) not in matched_menu_ids]
+    # ---- Daily menus are NOT published as standalone pages.
+    # ---- Same-day menus are inlined into the matching report (above).
+    # ---- Menus without a same-day report are intentionally not published.
+    if mirror is not None and menus_fetched:
         _LOGGER.info(
-            "Menu standalone: %d (%d embedded inside reports)",
-            len(standalone_menus), len(matched_menu_ids),
+            "Menu mirror: %d total fetched, %d inlined into reports, %d had no matching report (skipped)",
+            len(menus_fetched), len(matched_menu_ids), len(menus_fetched) - len(matched_menu_ids),
         )
-        if args.limit:
-            standalone_menus = standalone_menus[: args.limit]
-        _publish_batch(standalone_menus, mirror.publish_menu, "Menu")
 
     return 0
 
