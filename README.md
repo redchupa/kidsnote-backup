@@ -66,7 +66,7 @@
 > - [ ] 키즈노트 계정 (PC 브라우저로 로그인 가능해야 함)
 > - [ ] 노션 계정 (무료 플랜 OK) — 없으면 https://www.notion.so 가입
 > - [ ] GitHub 계정 — 없으면 https://github.com 가입
-> - [ ] Firefox 브라우저 — 없으면 https://www.mozilla.org/firefox 설치 (쿠키 추출에 필요)
+> - [ ] Chrome 또는 엣지 브라우저 (Firefox도 가능. 6단계에서 쿠키 추출)
 
 ## 1단계. 이 repo를 내 GitHub로 fork
 
@@ -146,21 +146,37 @@ https://www.notion.so/내워크스페이스/238f5e29c0894adfb6c4d8e1a5b2c3d4?v=a
 
 ✅ 성공 신호: 32자 hex 문자열이 클립보드에 있음.
 
-## 6단계. 키즈노트 sessionid 쿠키 가져오기
+## 6단계. 키즈노트 sessionid 쿠키 가져오기 (Chrome 기준)
 
-**반드시 Firefox**로 진행하세요 (Chrome은 일부 버전에서 쿠키가 안 보입니다).
+> Chrome 외에도 엣지(같은 화면) / Firefox(`F12 → 저장소`) 모두 가능. 아래는 Chrome 기준.
 
-1. Firefox로 https://www.kidsnote.com 접속 후 평소처럼 로그인
-2. 로그인된 화면에서 **`F12`** 키 (개발자 도구 열림)
-3. 개발자 도구 상단 탭에서 **`저장소`** 클릭
-   - 안 보이면 탭 줄 끝의 **`>>`** 클릭 → 목록에서 `저장소` 선택
-4. 좌측 트리에서 **`쿠키`** 펼치기 → **`https://www.kidsnote.com`** 클릭
-5. 우측 표가 나타남. **`이름` 열에서 `sessionid`** 행 찾기
-6. 그 행의 **`값` 칸을 더블클릭** → 전체 선택된 상태에서 `Ctrl+C` 복사
+1. **Chrome**으로 https://www.kidsnote.com 접속 후 평소처럼 로그인
+2. 로그인된 상태에서 **`F12`** 키 → 개발자 도구 열림
+3. 상단 탭에서 **`Application`** 클릭
+   - 안 보이면 탭 줄 끝의 **`>>`** 클릭 → 목록에서 `Application` 선택
+4. 왼쪽 사이드바 `Storage` 섹션 아래 **`Cookies`** 펼치기 → **`https://www.kidsnote.com`** 클릭
+5. 오른쪽에 표가 나옴. 컬럼: Name | Value | Domain | Path | Expires | Size ...
+6. 표에서 **다음 두 조건을 만족하는 한 행** 찾기:
+   - **Name** 열이 정확히 **`sessionid`**
+   - **Domain** 열이 **`.kidsnote.com`** (앞에 점 있음)
+7. 그 행의 **`Value`** 칸 클릭 → 표시되는 문자열을 더블클릭 → `Ctrl+C` 복사
 
-쿠키 값 예시: `ycen2ydnwm2vsoj3zxe618k5nugt7j66` (32자 정도)
+쿠키 값 예시: `ycen2ydnwm2vsoj3zxe618k5nugt7j66` (32자 정도, 영문 소문자+숫자)
 
 ⚠️ 메모장에 붙여두세요.
+
+### 🚫 이름이 비슷해서 헷갈리는 쿠키들 (전부 무시)
+
+쿠키 목록을 보면 sessionid처럼 보이지만 **다른 용도**인 것들이 있어요. 다음 쿠키는 **절대 복사하지 마세요**:
+
+| 쿠키 이름 | 왜 무관한가 |
+|---|---|
+| `_kau`, `_kawlt`, `_kawltea`, `_kdt`, `_karb`, `_kasl`, `_kadu` 등 `_k*` | Domain이 `.kakao.com` — 카카오 광고/트래킹용 |
+| `ch-session-127152`, `ch-veil-id` | 채널톡(고객문의 위젯) 세션 |
+| `current_user` | 사용자 ID 표시용 (값이 짧음, sessionid 아님) |
+| `_kn_visitorId`, `_gcl_au`, `_ga*`, `_dd_s` | 방문자 추적용 |
+
+**정답은 단 하나** — `Name` 정확히 `sessionid` + `Domain` 정확히 `.kidsnote.com`.
 
 > 💡 이 쿠키는 약 **30일 후 만료**됩니다. 만료되면 워크플로 실행 시 에러가 나는데, 그때 이 6단계만 다시 하면 됩니다.
 
