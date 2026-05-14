@@ -509,6 +509,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="For unit testing: pick one report per month (newest "
                          "of each calendar month), instead of N most-recent. "
                          "Useful to verify coverage across a wide date range.")
+    ap.add_argument("--force-refresh", action="store_true",
+                    help="Re-publish every report by archiving its existing "
+                         "Notion page first (bypasses Report-ID dedup). Use "
+                         "after prompt/LLM changes so old callouts get "
+                         "regenerated. Sentinel dashboard pages are never "
+                         "touched by this — they're always replaced anyway.")
     ap.add_argument("--dump-raw", action="store_true",
                     help="Dump the raw /reports/ JSON to backup_root for inspection. "
                          "Ignored when --no-local-save is set.")
@@ -546,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Notion mirror setup (if requested) -----
     mirror = None
     skip_ids: set[int] = set()
+    page_map: dict[int, str] = {}
     if args.publish_to_notion:
         from notion_mirror import NotionMirror  # local module
         token = _resolve_secret(env, "NOTION_TOKEN")
@@ -557,8 +564,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         mirror = NotionMirror(token=token, database_id=db_id)
         try:
-            skip_ids = mirror.existing_report_ids()
-            _LOGGER.info("Notion DB: %d existing report pages will be skipped", len(skip_ids))
+            page_map = mirror.existing_report_page_map()
+            if args.force_refresh:
+                _LOGGER.info(
+                    "Notion DB: --force-refresh active, %d existing pages will be "
+                    "archived + re-published", len(page_map),
+                )
+                # Empty skip_ids so every report gets re-published.
+            else:
+                skip_ids = set(page_map.keys())
+                _LOGGER.info(
+                    "Notion DB: %d existing report pages will be skipped", len(skip_ids),
+                )
         except Exception as e:
             sys.exit(f"Notion DB query failed: {e}")
 
@@ -652,6 +669,10 @@ def main(argv: list[str] | None = None) -> int:
             xid = int(x.get("id", 0))
             pct = (idx / total * 100) if total else 100.0
             try:
+                # --force-refresh: archive prior version (if any) so the
+                # new prompt-style callouts replace the old ones.
+                if args.force_refresh and xid in page_map:
+                    mirror.archive_by_report_id(xid, page_map)
                 res = publish_fn(x, sess)
                 publish_results.append(res)
                 pub += 1

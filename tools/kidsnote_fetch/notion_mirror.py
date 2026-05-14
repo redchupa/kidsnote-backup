@@ -451,9 +451,17 @@ class NotionMirror:
 
     def existing_report_ids(self) -> set[int]:
         """Walk the whole database once, return every existing `Report ID`."""
+        return set(self.existing_report_page_map().keys())
+
+    def existing_report_page_map(self) -> dict[int, str]:
+        """Map every existing `Report ID` to its Notion page id.
+
+        Used by --force-refresh to archive prior versions of each
+        report before publishing the new prompt-style callouts.
+        """
         self._resolve_schema()
         assert self._prop_report_id is not None
-        out: set[int] = set()
+        out: dict[int, str] = {}
         cursor: str | None = None
         while True:
             body: dict[str, Any] = {"page_size": 100}
@@ -471,15 +479,33 @@ class NotionMirror:
                 props = page.get("properties") or {}
                 rid_prop = props.get(self._prop_report_id) or {}
                 rid = rid_prop.get("number")
-                if rid is not None:
-                    try:
-                        out.add(int(rid))
-                    except (TypeError, ValueError):
-                        pass
+                if rid is None:
+                    continue
+                try:
+                    rid_int = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                # Skip sentinels (-1..-7) so force-refresh of regular
+                # reports never archives the dashboards.
+                if rid_int < 0:
+                    continue
+                out[rid_int] = page["id"]
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
         return out
+
+    def archive_by_report_id(self, report_id: int, page_map: dict[int, str]) -> bool:
+        """Archive the existing Notion page for `report_id` if one exists.
+
+        Returns True when a page was archived. Idempotent — safe to call
+        for IDs not yet in the DB.
+        """
+        page_id = page_map.pop(report_id, None)
+        if not page_id:
+            return False
+        self._archive_page(page_id)
+        return True
 
     # ----------------------------------------------------------- image upload
 
@@ -1013,45 +1039,58 @@ class NotionMirror:
 
     @classmethod
     def _child_voice_diary(cls, text: str, child_name: str = "") -> str | None:
-        """Convert teacher's alimnota into child's first-person diary."""
+        """Convert teacher's alimnota into child's first-person diary.
+
+        Uses a one-shot example because instruction-only prompts caused
+        weaker models (qwen2.5:7b) to copy the teacher's third-person
+        narration verbatim instead of converting perspective.
+        """
         if not text or len(text.strip()) < 30:
             return None
-        given = _given_name(child_name)
-        name_hint = f" 자녀 이름은 ``{given}``." if given else ""
+        given = _given_name(child_name) or "아이"
         prompt = (
-            "다음 어린이집 알림장 본문을 자녀의 1인칭(``나``) 시점 일기로 "
-            "한국어로만 짧게(2-3문장) 바꿔써. 어린이 어휘로 자연스럽게."
-            f"{name_hint} **규칙**: ① 한국어만 사용 — 중국어/한자 절대 금지. "
-            "② 본문에 적힌 내용만 사용 — 없는 사실(나이, 몸무게, 시간, 사물 "
-            "등) 만들지 마. ③ 다른 설명 없이 일기 본문만 답해.\n\n"
-            f"본문: {text[:1500]}\n\n자녀의 일기:"
+            f"다음 어린이집 알림장을 자녀({given})의 1인칭 일기로 "
+            "한국어 2-3문장으로 바꿔써. ``나``가 주어가 되어야 하고, "
+            "선생님 호칭(``어머니~`` 등)은 절대 쓰지 마.\n\n"
+            "[예시]\n"
+            f"알림장: {given}이는 친구에게 장난감을 건네주며 사회성이 "
+            "자라는 모습이었습니다. ``동물농장`` 노래에 박수를 잘 쳤어요.\n"
+            f"일기: 오늘 친구한테 내 장난감을 줬어. 친구가 좋아하니까 "
+            "나도 기분이 좋았어! ``동물농장`` 노래가 나오니까 짝짝 박수도 쳤지롱.\n\n"
+            "[지금 변환할 알림장]\n"
+            f"알림장: {text[:1200]}\n"
+            "일기:"
         )
-        return cls._ask_ollama(prompt, max_chars=350, num_predict=120)
+        return cls._ask_ollama(prompt, max_chars=350, num_predict=130)
 
     @classmethod
     def _parent_voice_diary(cls, text: str, child_name: str = "") -> str | None:
         """Parent-to-child love letter inspired by today's alimnota.
 
         Written so the child, years later, will feel moved when reading it
-        back — addresses the child directly with the proper Korean
-        vocative (``우리 하린아`` / ``우리 수아야``), warm and intimate,
-        NOT the parent's third-person diary about the day.
+        back. Uses a one-shot example because abstract instructions like
+        "느껴지게" leaked verbatim into earlier model outputs.
         """
         if not text or len(text.strip()) < 30:
             return None
         addressee = _addressee(child_name)
+        given = _given_name(child_name) or "아이"
         prompt = (
-            "다음은 어린이집에서 받은 알림장이야. 이 알림장을 읽은 부모가 "
-            "자녀에게 직접 들려주고 싶은 따뜻한 한 마디를, 자녀가 자라서 "
-            "이 글을 다시 보았을 때 감동받을 수 있도록 짧은 편지(2-3문장)로 "
-            f"써. 반드시 ``{addressee},``로 시작하고, 부모가 자녀에게 직접 "
-            "말하는 다정한 어조로. 부모의 사랑·자랑·기특함이 느껴지게. "
-            "**규칙**: ① 한국어만 사용 — 중국어 한자 절대 금지. ② 알림장에 "
-            "적힌 내용만 사용 — 없는 사실(나이, 몸무게, 시간 등) 만들지 마. "
-            "③ 다른 설명 없이 편지 본문만 답해.\n\n"
-            f"알림장: {text[:1500]}\n\n자녀에게:"
+            f"부모가 자녀({given})에게 쓰는 짧은 편지. 알림장에 나온 "
+            "그날의 실제 사건 1-2개를 구체적으로 언급하면서, 자녀가 자라서 "
+            "이 편지를 봤을 때 부모의 사랑이 전해지게 써. 2-3문장, 한국어.\n\n"
+            "[예시]\n"
+            f"알림장: {given}이는 친구에게 장난감을 건네주며 사회성이 "
+            "자라는 모습을 보였습니다. ``동물농장`` 노래에 박수를 쳤어요.\n"
+            f"편지: {addressee}, 오늘 친구에게 장난감을 양보했다는 얘기를 "
+            "들었어. 엄마는 네가 친구를 아끼는 마음이 자라는 모습이 "
+            f"참 자랑스러웠단다. ``동물농장`` 노래에 짝짝 박수치는 너의 "
+            "모습이 눈에 선해.\n\n"
+            "[지금 작성할 편지]\n"
+            f"알림장: {text[:1200]}\n"
+            "편지:"
         )
-        return cls._ask_ollama(prompt, max_chars=400, num_predict=150)
+        return cls._ask_ollama(prompt, max_chars=400, num_predict=160)
 
     @classmethod
     def _summary_oneliner(cls, text: str) -> str | None:
@@ -2672,22 +2711,29 @@ class NotionMirror:
             items = reports_by_month[ym]
             if not items:
                 continue
-            # Build a compact joined text for LLM
             joined = "\n\n".join(
                 (r.get("content") or "").strip()[:300] for r in items[:30]
             )[:4500]
-            given = _given_name(child_name)
+            # Skip sparse months — LLM fills with generic filler otherwise
+            if len(joined.strip()) < 200:
+                continue
+            given = _given_name(child_name) or "아이"
             prompt = (
-                f"다음은 어린이집 자녀의 {ym} 한 달치 알림장 모음이야. "
-                "이를 바탕으로 그 달의 자녀 성장 스토리를 따뜻한 톤의 "
-                "한 단락(3-4문장)으로 한국어로 써줘. "
-                f"{'자녀 이름은 ``' + given + '``.' if given else ''} "
-                "**규칙**: ① 한국어만 사용 — 중국어 한자 절대 금지. "
-                "② 알림장에 적힌 사실만 사용 — 없는 사건(담배, 음주, 가상의 "
-                "나이/몸무게/시간 등) 절대 만들지 마. ③ 자녀를 직접 호명하지 "
-                "말고 ``우리 아이`` 또는 이름(``" + (given or "아이") + "``)으로만 지칭. "
-                "④ 다른 설명 없이 본문만 답해.\n\n"
-                f"알림장 모음:\n{joined}\n\n성장 스토리:"
+                f"다음은 어린이집 {given}이의 {ym} 한 달치 알림장 모음이야. "
+                "이를 바탕으로 그 달의 성장 스토리를 한 단락(3-4문장)으로 "
+                "한국어로 써. 알림장에 실제 등장한 활동·관찰 2-3개를 "
+                f"구체적으로 인용해. 자녀는 ``{given}이``로만 지칭.\n\n"
+                "[예시]\n"
+                f"알림장 모음: {given}이가 ``동물농장`` 노래에 박수… "
+                "친구에게 장난감을 건네줌… 송편 만들기 반죽 던짐…\n"
+                f"성장 스토리: 이번 달 {given}이는 사회성이 부쩍 자라 "
+                "친구에게 장난감을 건네주는 따뜻한 모습을 보여주었습니다. "
+                "``동물농장`` 노래에 박수를 치며 리듬감도 표현했고, "
+                "추석맞이 송편 만들기에서는 낯선 촉감에 반죽을 던지는 "
+                "솔직한 반응도 귀여웠습니다.\n\n"
+                "[지금 작성할 성장 스토리]\n"
+                f"알림장 모음: {joined}\n"
+                "성장 스토리:"
             )
             story = self._ask_ollama(prompt, max_chars=600, num_predict=300, timeout=180)
             if not story:
@@ -2739,15 +2785,24 @@ class NotionMirror:
             if not body or len(body) < 40:
                 continue
             date = (r.get("date_written") or "")[:10]
-            given = _given_name(child_name)
+            given = _given_name(child_name) or "아이"
             prompt = (
-                "다음 어린이집 알림장 본문에서 자녀가 "
-                "``처음으로 X를 했다`` 류의 발달 마일스톤이 있다면 "
-                "한 줄(15자 이내)로 추출해. 없으면 ``없음`` 한 단어만 답해. "
-                f"{'자녀 이름은 ``' + given + '``.' if given else ''} "
-                "**규칙**: 한국어만 사용 (중국어 한자 금지). 본문에 적힌 "
-                "내용만 사용. 본문에 명시되지 않은 마일스톤은 절대 만들지 마.\n\n"
-                f"본문: {body[:1200]}\n\n마일스톤:"
+                f"다음 어린이집 알림장에서 자녀({given})의 발달·성장 "
+                "단서를 한 줄(15자 이내)로 뽑아. 새로운 행동, 말, 표현, "
+                "능력, 사회성, 호기심 등을 짧게 명사구로. 단서가 정말 "
+                "없으면 ``없음``만 답해.\n\n"
+                "[예시]\n"
+                f"알림장: {given}이가 친구에게 장난감을 건네주며 사회성이 "
+                "자라는 모습을 보였습니다.\n"
+                "단서: 친구에게 장난감 양보\n\n"
+                f"알림장: ``동물농장`` 노래에 손을 흔들고 박수를 치며 "
+                "리듬을 잘 표현했어요.\n"
+                "단서: 노래에 맞춰 리듬감 표현\n\n"
+                f"알림장: 오늘은 식단으로 미역국, 흰쌀밥, 갈비찜을 먹었습니다.\n"
+                "단서: 없음\n\n"
+                "[지금 분석할 알림장]\n"
+                f"알림장: {body[:1200]}\n"
+                "단서:"
             )
             ms = self._ask_ollama(prompt, max_chars=60, num_predict=40, timeout=60)
             if not ms or ms.strip() in ("없음", "없다", "없습니다", "없어요"):
@@ -2840,22 +2895,33 @@ class NotionMirror:
         ]
         if not teacher_reports:
             return None
-        # Most-recent first, take up to 60 to fit context
+        # Most-recent first, take up to 25 with tight per-report quota
+        # (older code took 60 * 300 chars = 8000 — model copy-pasted the
+        # input instead of summarizing. Shrink to 25 * 100 = ~2500.)
         teacher_reports = sorted(
             teacher_reports, key=lambda r: r.get("date_written") or "", reverse=True,
-        )[:60]
-        joined = "\n\n".join(
-            (r.get("content") or "").strip()[:300] for r in teacher_reports
-        )[:8000]
-        given = _given_name(child_name)
+        )[:25]
+        joined = "\n".join(
+            "- " + (r.get("content") or "").strip()[:100]
+            for r in teacher_reports
+        )[:2500]
+        given = _given_name(child_name) or "아이"
         prompt = (
-            "다음은 어린이집 선생님이 1년 동안 작성한 알림장 모음이야. "
-            "이 선생님께 보낼 진심 어린 감사 편지를 한국어로 5-6문장으로 "
-            f"써줘. {'자녀 이름은 ``' + given + '``.' if given else ''} "
-            "**규칙**: ① 한국어만 사용 (중국어 한자 금지). ② 알림장에 "
-            "실제 등장한 활동·에피소드를 인용하면서 작성. 없는 사건 "
-            "만들지 마. ③ 편지 본문만 답해.\n\n"
-            f"알림장 모음:\n{joined}\n\n감사 편지:"
+            f"다음은 어린이집 선생님이 자녀({given})에 대해 1년간 쓴 "
+            "알림장의 짧은 발췌야. 이를 바탕으로 부모가 선생님께 보낼 "
+            "감사 편지(4-5문장)를 한국어로 써. 발췌에 실제 등장한 활동·"
+            "에피소드 2-3개를 구체적으로 언급해.\n\n"
+            "[예시]\n"
+            f"발췌:\n- {given}이가 친구에게 장난감을 양보함\n"
+            "- ``동물농장`` 노래에 박수\n- 송편 만들기에 참여\n"
+            f"편지: 선생님, 한 해 동안 우리 {given}이를 사랑으로 돌봐주셔서 "
+            "진심으로 감사드립니다. 친구에게 장난감을 양보하는 사회성도, "
+            "``동물농장`` 노래에 박수를 치는 즐거움도, 송편을 만져보던 "
+            f"낯선 촉감의 기억까지, 모두 선생님 덕분에 우리 {given}이의 "
+            "소중한 한 해가 되었습니다. 따뜻한 손길 잊지 않겠습니다.\n\n"
+            "[지금 작성할 감사 편지]\n"
+            f"발췌:\n{joined}\n"
+            "편지:"
         )
         letter = self._ask_ollama(prompt, max_chars=900, num_predict=400, timeout=180)
         if not letter:
