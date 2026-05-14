@@ -133,6 +133,62 @@ def _addressee(child_name: str) -> str:
     return f"우리 {given}{_vocative_marker(given)}"
 
 
+def _strip_lead_meta(text: str) -> str:
+    """Drop leading lines that restate the task instead of answering it.
+
+    llama3.1 sometimes echoes the prompt back as a preamble
+    (``알림장을 바탕으로 ~를 써보겠습니다.``) before producing the
+    real content. We detect short opening lines that contain task
+    verbs and drop them until the first real-content line.
+    """
+    if not text:
+        return text
+    TASK_VERBS = (
+        "써보겠습니다", "써봅니다", "써 보겠", "써 봅니다", "써보세요",
+        "써 보겠습니다", "써 봅시다",
+        "정리해보겠습니다", "정리해보세요", "정리해드리겠습니다",
+        "분석해보겠습니다", "분석해드리겠습니다",
+        "구체적으로 인용", "한 단락으로",
+    )
+    lines = text.split("\n")
+    out: list[str] = []
+    started = False
+    for line in lines:
+        if not started:
+            s = line.strip()
+            if not s:
+                continue
+            short = len(s) < 130
+            if short and any(v in s for v in TASK_VERBS):
+                continue
+            if short and s.endswith(("다음과 같습니다.", "다음과 같다.", "다음과 같이.")):
+                continue
+            started = True
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _extract_after_final_label(text: str, labels: tuple[str, ...]) -> str:
+    """If any label appears in ``text``, return content after the LAST one.
+
+    Some models produce analysis + the final answer prefixed by a
+    section label like ``성장 스토리:``. The final block is usually the
+    cleanest pass — keep only that.
+    """
+    if not text or not labels:
+        return text
+    best_idx = -1
+    best_len = 0
+    for label in labels:
+        idx = text.rfind(label)
+        if idx > best_idx:
+            best_idx = idx
+            best_len = len(label)
+    if best_idx >= 0:
+        return text[best_idx + best_len:].strip()
+    return text
+
+
 def _strip_cjk(text: str) -> tuple[str, int]:
     """Strip CJK Unified Ideographs (한자/중국어/일본어 한자) from ``text``.
 
@@ -986,6 +1042,8 @@ class NotionMirror:
         temperature: float = 0.3,
         num_predict: int = 200,
         timeout: int = 120,
+        final_labels: tuple[str, ...] = (),
+        strip_meta: bool = True,
     ) -> str | None:
         """Generic Ollama text-generation call. Returns None when Ollama
         isn't reachable or the response is empty / garbage. Output is
@@ -1017,6 +1075,13 @@ class NotionMirror:
             return None
         # Drop wrapping ``"`` and leading dashes/asterisks
         out = out.strip().strip('"').strip("'").lstrip("- ").lstrip("* ").strip()
+        # If the model produced analysis + a clean final block prefixed
+        # with a section label, keep only what's after the last label.
+        if final_labels:
+            out = _extract_after_final_label(out, final_labels)
+        # Drop task-restatement lead-ins ("...써봅니다.").
+        if strip_meta:
+            out = _strip_lead_meta(out)
         # Strip any Chinese hanja the model leaked (qwen2.5 occasionally
         # falls back to Chinese mid-sentence). Hangul/punctuation kept.
         original_len = len(out)
@@ -1061,7 +1126,10 @@ class NotionMirror:
             f"알림장: {text[:1200]}\n"
             "일기:"
         )
-        return cls._ask_ollama(prompt, max_chars=350, num_predict=130)
+        return cls._ask_ollama(
+            prompt, max_chars=350, num_predict=130,
+            final_labels=("일기:",),
+        )
 
     @classmethod
     def _parent_voice_diary(cls, text: str, child_name: str = "") -> str | None:
@@ -1090,7 +1158,10 @@ class NotionMirror:
             f"알림장: {text[:1200]}\n"
             "편지:"
         )
-        return cls._ask_ollama(prompt, max_chars=400, num_predict=160)
+        return cls._ask_ollama(
+            prompt, max_chars=400, num_predict=160,
+            final_labels=("편지:",),
+        )
 
     @classmethod
     def _summary_oneliner(cls, text: str) -> str | None:
@@ -2722,20 +2793,26 @@ class NotionMirror:
                 f"다음은 어린이집 {given}이의 {ym} 한 달치 알림장 모음이야. "
                 "이를 바탕으로 그 달의 성장 스토리를 한 단락(3-4문장)으로 "
                 "한국어로 써. 알림장에 실제 등장한 활동·관찰 2-3개를 "
-                f"구체적으로 인용해. 자녀는 ``{given}이``로만 지칭.\n\n"
-                "[예시]\n"
-                f"알림장 모음: {given}이가 ``동물농장`` 노래에 박수… "
-                "친구에게 장난감을 건네줌… 송편 만들기 반죽 던짐…\n"
-                f"성장 스토리: 이번 달 {given}이는 사회성이 부쩍 자라 "
-                "친구에게 장난감을 건네주는 따뜻한 모습을 보여주었습니다. "
-                "``동물농장`` 노래에 박수를 치며 리듬감도 표현했고, "
-                "추석맞이 송편 만들기에서는 낯선 촉감에 반죽을 던지는 "
-                "솔직한 반응도 귀여웠습니다.\n\n"
-                "[지금 작성할 성장 스토리]\n"
+                f"구체적으로 인용해. 자녀는 ``{given}이``로만 지칭. "
+                "다른 설명·서두 없이 바로 본문만 답해.\n\n"
+                "[예시 — 형식과 톤만 학습. 활동(피아노/발레/자화상)은 "
+                "절대 베끼지 마. 아래 실제 알림장 내용만 활용.]\n"
+                "알림장 모음: 음악교실에서 피아노 치기 · 발레수업 첫 도전 · "
+                "미술시간 자화상 그리기\n"
+                f"성장 스토리: 이번 달 {given}이는 예술적 표현 능력이 "
+                "한층 풍부해졌습니다. 음악교실에서 피아노 건반을 누르며 "
+                "자신만의 멜로디를 만들었고, 발레수업 첫 도전에서는 "
+                "떨림을 이겨내며 자세를 따라 했습니다. 미술시간 자화상에서는 "
+                "거울을 보며 자기 모습을 또렷이 표현해 냈습니다.\n\n"
+                "[지금 작성할 실제 성장 스토리 — 위 예시의 활동(피아노/발레/"
+                "자화상)은 절대 출력에 사용 X. 아래 알림장에 나온 사건만 활용.]\n"
                 f"알림장 모음: {joined}\n"
                 "성장 스토리:"
             )
-            story = self._ask_ollama(prompt, max_chars=600, num_predict=300, timeout=180)
+            story = self._ask_ollama(
+                prompt, max_chars=600, num_predict=300, timeout=180,
+                final_labels=("성장 스토리:",),
+            )
             if not story:
                 continue
             blocks.append({
@@ -2804,10 +2881,29 @@ class NotionMirror:
                 f"알림장: {body[:1200]}\n"
                 "단서:"
             )
-            ms = self._ask_ollama(prompt, max_chars=60, num_predict=40, timeout=60)
-            if not ms or ms.strip() in ("없음", "없다", "없습니다", "없어요"):
+            ms = self._ask_ollama(
+                prompt, max_chars=60, num_predict=40, timeout=60,
+                final_labels=("단서:",),
+            )
+            if not ms:
                 continue
             ms = ms.split("\n")[0].strip()
+            # "없음" anywhere in the response (model often answers
+            # ``알림장의 단서는 "없음"입니다.`` rather than just ``없음``).
+            if any(tok in ms for tok in ("없음", "없다", "없습니다", "없어요", "찾을 수 없")):
+                continue
+            # Conversational chatter ("좋네요!") isn't a milestone.
+            if ms.endswith(("!", "?")):
+                continue
+            CHATTER_TAILS = (
+                "좋네요.", "보내요.", "같네요.", "같아요.", "있어요.", "이에요.",
+                "보냈어요.", "있겠지요.", "있지요.", "보내요!", "있어요!",
+            )
+            if any(ms.endswith(t) for t in CHATTER_TAILS):
+                continue
+            # Cap length — milestones should be a noun phrase, not a sentence.
+            if len(ms) > 60:
+                continue
             # Dedup similar milestones (case-insensitive substring)
             ms_key = ms.lower()
             if any(ms_key in s or s in ms_key for s in seen_milestones):
@@ -2862,7 +2958,10 @@ class NotionMirror:
                 "③ 다른 설명 없이 1~5번 목록만 답해.\n\n"
                 f"알림장:\n{joined}\n\nTOP 5:"
             )
-            top = self._ask_ollama(prompt, max_chars=400, num_predict=200, timeout=120)
+            top = self._ask_ollama(
+                prompt, max_chars=400, num_predict=200, timeout=120,
+                final_labels=("TOP 5:", "Top 5:"),
+            )
             if not top:
                 continue
             blocks.append({
@@ -2923,7 +3022,10 @@ class NotionMirror:
             f"발췌:\n{joined}\n"
             "편지:"
         )
-        letter = self._ask_ollama(prompt, max_chars=900, num_predict=400, timeout=180)
+        letter = self._ask_ollama(
+            prompt, max_chars=900, num_predict=400, timeout=180,
+            final_labels=("편지:", "감사 편지:"),
+        )
         if not letter:
             return None
         blocks: list[dict[str, Any]] = [{
