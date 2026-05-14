@@ -144,11 +144,20 @@ def _strip_lead_meta(text: str) -> str:
     if not text:
         return text
     TASK_VERBS = (
+        # Various 쓰- spacings
         "써보겠습니다", "써봅니다", "써 보겠", "써 봅니다", "써보세요",
-        "써 보겠습니다", "써 봅시다",
-        "정리해보겠습니다", "정리해보세요", "정리해드리겠습니다",
-        "분석해보겠습니다", "분석해드리겠습니다",
+        "써 보겠습니다", "써 봅시다", "써보아요",
+        # 정리해- spacings
+        "정리해보겠습니다", "정리해 보겠습니다", "정리해보세요",
+        "정리해드리겠습니다", "정리해 드리겠습니다", "정리합니다",
+        # 분석해- spacings
+        "분석해보겠습니다", "분석해 보겠습니다",
+        "분석해드리겠습니다", "분석해 드리겠습니다",
+        # 추출해- spacings (milestone)
+        "추출해보겠습니다", "추출해 보겠습니다",
+        # Other lead-in cues
         "구체적으로 인용", "한 단락으로",
+        "다음과 같습니다", "다음과 같다",
     )
     lines = text.split("\n")
     out: list[str] = []
@@ -2815,6 +2824,19 @@ class NotionMirror:
             )
             if not story:
                 continue
+            # Example-bleed guard: when a sparse month's alimnota has too
+            # little for the model to anchor on, it copies the example
+            # output's activities verbatim (피아노/발레/자화상/음악교실/
+            # 미술시간 — none of these would legitimately appear in
+            # daycare alimnota). Skip the month rather than emit a
+            # plausibly-real but fully fictional story.
+            BLEED_TOKENS = ("피아노", "발레", "자화상", "음악교실", "미술시간")
+            if any(tok in story for tok in BLEED_TOKENS):
+                _LOGGER.warning(
+                    "growth story for %s leaked example tokens (%s) — skipping",
+                    ym, ", ".join(t for t in BLEED_TOKENS if t in story),
+                )
+                continue
             blocks.append({
                 "object": "block",
                 "type": "heading_2",
@@ -2865,18 +2887,24 @@ class NotionMirror:
             given = _given_name(child_name) or "아이"
             prompt = (
                 f"다음 어린이집 알림장에서 자녀({given})의 발달·성장 "
-                "단서를 한 줄(15자 이내)로 뽑아. 새로운 행동, 말, 표현, "
-                "능력, 사회성, 호기심 등을 짧게 명사구로. 단서가 정말 "
-                "없으면 ``없음``만 답해.\n\n"
-                "[예시]\n"
+                "단서를 명사구 한 줄(20자 이내)로 뽑아. "
+                "**규칙**: ① 반드시 ``명사구``로만 답해 — ``~다``, "
+                "``~요``, ``~습니다``, ``~보였습니다`` 같은 종결어미 "
+                "절대 금지. ② 단서가 정말 없으면 ``없음``만 답해.\n\n"
+                "[예시 — 명사구 형식 ✓]\n"
                 f"알림장: {given}이가 친구에게 장난감을 건네주며 사회성이 "
                 "자라는 모습을 보였습니다.\n"
                 "단서: 친구에게 장난감 양보\n\n"
                 f"알림장: ``동물농장`` 노래에 손을 흔들고 박수를 치며 "
                 "리듬을 잘 표현했어요.\n"
                 "단서: 노래에 맞춰 리듬감 표현\n\n"
+                f"알림장: 처음으로 한 걸음을 떼었습니다.\n"
+                "단서: 첫 걸음\n\n"
                 f"알림장: 오늘은 식단으로 미역국, 흰쌀밥, 갈비찜을 먹었습니다.\n"
                 "단서: 없음\n\n"
+                "[잘못된 예 ✗ — 문장 형식은 답하지 마.]\n"
+                "단서: 활기차고 씩씩한 모습을 보였습니다.\n"
+                "단서: 사회성이 자라는 모습을 보였습니다.\n\n"
                 "[지금 분석할 알림장]\n"
                 f"알림장: {body[:1200]}\n"
                 "단서:"
@@ -2900,6 +2928,18 @@ class NotionMirror:
                 "보냈어요.", "있겠지요.", "있지요.", "보내요!", "있어요!",
             )
             if any(ms.endswith(t) for t in CHATTER_TAILS):
+                continue
+            # Sentence-form output — milestone should be a noun phrase, not
+            # a description like "...보였습니다." or "...했어요." The prompt
+            # asks for noun-phrase only; this is a safety net.
+            SENTENCE_TAILS = (
+                "습니다.", "습니다", "었어요.", "었습니다.", "었습니다",
+                "되었어요.", "되었습니다.", "되었습니다",
+                "보였어요.", "보였습니다.", "보였습니다", "보였다.",
+                "지냈어요.", "지냈습니다.", "지냈습니다",
+                "했어요.", "했습니다.", "했습니다", "했다.",
+            )
+            if any(ms.endswith(t) for t in SENTENCE_TAILS):
                 continue
             # Cap length — milestones should be a noun phrase, not a sentence.
             if len(ms) > 60:
