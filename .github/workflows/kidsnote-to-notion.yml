@@ -49,10 +49,11 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     # Long timeout: a 1-year backfill with photo-heavy reports
-    # (avg 15-25 images/report) can take 2-3 hours. GitHub-hosted
-    # runners cap at 6 hours; public repos pay nothing for that.
+    # (avg 15-25 images/report + Ollama-driven LLM dashboards) ran past
+    # the 6h cap on the first try, so we ask for 12h. GitHub-hosted
+    # runners cap public repos at 35 hours of wall-time per workflow.
     # Re-runs after the first backfill are fast (dedup skips done).
-    timeout-minutes: 360
+    timeout-minutes: 720
 
     steps:
       - uses: actions/checkout@v4
