@@ -133,6 +133,35 @@ def _addressee(child_name: str) -> str:
     return f"우리 {given}{_vocative_marker(given)}"
 
 
+def _strip_cjk(text: str) -> tuple[str, int]:
+    """Strip CJK Unified Ideographs (한자/중국어/일본어 한자) from ``text``.
+
+    Returns ``(cleaned, removed_count)``. Korean Hangul is preserved
+    (separate Unicode block); only the CJK ideograph blocks
+    U+3400–U+4DBF, U+4E00–U+9FFF, and the CJK Extension blocks are
+    stripped. qwen2.5-family models occasionally leak Chinese into
+    Korean output; this is a defensive net to keep keepsake text clean.
+    """
+    if not text:
+        return text, 0
+    removed = 0
+    out_chars: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        is_cjk = (
+            0x3400 <= cp <= 0x4DBF
+            or 0x4E00 <= cp <= 0x9FFF
+            or 0x20000 <= cp <= 0x2A6DF
+            or 0x2A700 <= cp <= 0x2B73F
+            or 0xF900 <= cp <= 0xFAFF  # CJK compatibility ideographs
+        )
+        if is_cjk:
+            removed += 1
+        else:
+            out_chars.append(ch)
+    return "".join(out_chars), removed
+
+
 def _safe_url(url: str) -> str:
     """Strip query string from a URL so signed-URL tokens never reach logs.
 
@@ -962,6 +991,22 @@ class NotionMirror:
             return None
         # Drop wrapping ``"`` and leading dashes/asterisks
         out = out.strip().strip('"').strip("'").lstrip("- ").lstrip("* ").strip()
+        # Strip any Chinese hanja the model leaked (qwen2.5 occasionally
+        # falls back to Chinese mid-sentence). Hangul/punctuation kept.
+        original_len = len(out)
+        out, cjk_removed = _strip_cjk(out)
+        if cjk_removed and original_len > 0:
+            ratio = cjk_removed / original_len
+            logging.getLogger(__name__).debug(
+                "ollama: stripped %d CJK chars (%.0f%% of output)",
+                cjk_removed, ratio * 100,
+            )
+            # If the LLM essentially answered in Chinese (>20% of chars),
+            # the remaining Korean fragments aren't trustworthy — drop it.
+            if ratio > 0.20:
+                return None
+            # Collapse the multi-space gaps left behind.
+            out = " ".join(out.split())
         if len(out) < 5:
             return None
         return out[:max_chars]
