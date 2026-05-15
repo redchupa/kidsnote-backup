@@ -2265,21 +2265,32 @@ class NotionMirror:
 
     # Pinned Report IDs for singleton system pages (kidsnote ids are
     # all positive 1e9+, so any negative number is safe).
+    # Dashboard titles use ``{year}`` placeholder so the page title shows
+    # the regeneration year ("📊 2026년 통계 대시보드"). Helps the user
+    # tell at-a-glance which year's snapshot they're looking at.
     DASHBOARD_REPORT_ID = -1
-    DASHBOARD_TITLE = "📊 통계 대시보드"
+    DASHBOARD_TITLE = "📊 {year}년 통계 대시보드"
     MEMORIES_REPORT_ID = -2
-    MEMORIES_TITLE = "📅 오늘의 추억"
+    MEMORIES_TITLE = "📅 {year}년 오늘의 추억"
     NUTRITION_REPORT_ID = -3
-    NUTRITION_TITLE = "🥗 영양 분석"
+    NUTRITION_TITLE = "🥗 {year}년 영양 분석"
     # LLM-driven storytelling pages (auto-skip when Ollama isn't reachable)
     GROWTH_STORY_REPORT_ID = -4
-    GROWTH_STORY_TITLE = "📖 매월 성장 스토리"
+    GROWTH_STORY_TITLE = "📖 {year}년 매월 성장 스토리"
     MILESTONES_REPORT_ID = -5
-    MILESTONES_TITLE = "🌟 우리 아이의 처음들 (마일스톤)"
+    MILESTONES_TITLE = "🌟 {year}년 우리 아이의 처음들 (마일스톤)"
     INTERESTS_REPORT_ID = -6
-    INTERESTS_TITLE = "🌱 분기별 관심사"
+    INTERESTS_TITLE = "🌱 {year}년 분기별 관심사"
     TEACHER_THANKS_REPORT_ID = -7
-    TEACHER_THANKS_TITLE = "💌 선생님께"
+    TEACHER_THANKS_TITLE = "💌 {year}년 선생님께"
+
+    @classmethod
+    def _dashboard_title(cls, template: str) -> str:
+        """Resolve ``{year}`` placeholder in a dashboard title template
+        using the current year. Centralised so every sentinel page
+        formats consistently.
+        """
+        return template.format(year=datetime.now().year)
 
     def _find_singleton_page(self, sentinel_report_id: int) -> str | None:
         """Locate an existing system singleton page by its sentinel Report ID."""
@@ -2335,7 +2346,7 @@ class NotionMirror:
         assert self._prop_title is not None and self._prop_report_id is not None
         properties: dict[str, Any] = {
             self._prop_title: {
-                "title": [{"text": {"content": self.DASHBOARD_TITLE}}],
+                "title": [{"text": {"content": self._dashboard_title(self.DASHBOARD_TITLE)}}],
             },
             self._prop_report_id: {"number": self.DASHBOARD_REPORT_ID},
         }
@@ -2574,7 +2585,7 @@ class NotionMirror:
         assert self._prop_title is not None and self._prop_report_id is not None
         properties: dict[str, Any] = {
             self._prop_title: {
-                "title": [{"text": {"content": self.MEMORIES_TITLE}}],
+                "title": [{"text": {"content": self._dashboard_title(self.MEMORIES_TITLE)}}],
             },
             self._prop_report_id: {"number": self.MEMORIES_REPORT_ID},
         }
@@ -2613,7 +2624,7 @@ class NotionMirror:
         assert self._prop_title is not None and self._prop_report_id is not None
         properties: dict[str, Any] = {
             self._prop_title: {
-                "title": [{"text": {"content": self.NUTRITION_TITLE}}],
+                "title": [{"text": {"content": self._dashboard_title(self.NUTRITION_TITLE)}}],
             },
             self._prop_report_id: {"number": self.NUTRITION_REPORT_ID},
         }
@@ -2848,7 +2859,7 @@ class NotionMirror:
             for chunk in self._chunk(story):
                 blocks.append(self._para(chunk))
         return self._replace_singleton(
-            self.GROWTH_STORY_REPORT_ID, self.GROWTH_STORY_TITLE, blocks,
+            self.GROWTH_STORY_REPORT_ID, self._dashboard_title(self.GROWTH_STORY_TITLE), blocks,
         )
 
     def publish_milestones(
@@ -2958,7 +2969,7 @@ class NotionMirror:
                 ]},
             })
         return self._replace_singleton(
-            self.MILESTONES_REPORT_ID, self.MILESTONES_TITLE, blocks,
+            self.MILESTONES_REPORT_ID, self._dashboard_title(self.MILESTONES_TITLE), blocks,
         )
 
     def publish_interests(
@@ -3016,7 +3027,7 @@ class NotionMirror:
                 if line:
                     blocks.append(self._para(line))
         return self._replace_singleton(
-            self.INTERESTS_REPORT_ID, self.INTERESTS_TITLE, blocks,
+            self.INTERESTS_REPORT_ID, self._dashboard_title(self.INTERESTS_TITLE), blocks,
         )
 
     def publish_teacher_thanks(
@@ -3082,7 +3093,7 @@ class NotionMirror:
         for chunk in self._chunk(letter):
             blocks.append(self._para(chunk))
         return self._replace_singleton(
-            self.TEACHER_THANKS_REPORT_ID, self.TEACHER_THANKS_TITLE, blocks,
+            self.TEACHER_THANKS_REPORT_ID, self._dashboard_title(self.TEACHER_THANKS_TITLE), blocks,
         )
 
 
