@@ -37,6 +37,15 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+  # Auto-resume: a 1-year backfill can take 18-30 hours of compute,
+  # but a GitHub-hosted runner caps a single job at 6 hours. Without
+  # cron, the user would have to manually re-trigger after every cap.
+  # With this schedule the workflow self-resumes every 4 hours; the
+  # script tracks elapsed time and exits cleanly at 5h30m so the next
+  # cron run can pick up via dedup. Once the backup is complete each
+  # cron run finishes in ~1-2 minutes (no new alimnotas to process).
+  schedule:
+    - cron: "15 */4 * * *"
 
 permissions:
   contents: read

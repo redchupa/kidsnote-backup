@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,24 @@ VIDEO_OBJECT_KEYS = ("attached_video", "video", "attached_videos")
 FILE_LIST_KEYS = ("attached_files", "files", "attachments")
 
 _LOGGER = logging.getLogger("kidsnote_fetch")
+
+# ------------------------------------------------------------------
+# Time budget for cron auto-resume
+# ------------------------------------------------------------------
+# GitHub-hosted runners hard-cap a single job at 6 hours. To make the
+# multi-run backfill fully autonomous (no manual re-trigger needed)
+# the workflow uses a 4-hour cron schedule and the script gracefully
+# stops processing once we approach the cap. Concurrency group ensures
+# the next cron run queues until the current one releases, so dedup
+# picks up where we left off.
+_START_TIME = time.monotonic()
+TIME_BUDGET_SEC = 5 * 3600 + 30 * 60  # 5h30m — 30 min safety margin
+DASHBOARD_RESERVE_SEC = 120  # keep 2 min for fast dashboards after publish loop
+
+
+def _remaining_budget() -> float:
+    """Seconds remaining in the workflow's self-imposed time budget."""
+    return TIME_BUDGET_SEC - (time.monotonic() - _START_TIME)
 
 
 def _safe_url(url: str) -> str:
@@ -665,7 +684,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         pub = 0
         fail = 0
+        stopped_early = False
         for idx, x in enumerate(to_pub, start=1):
+            # Graceful exit before the 6h hard cap so cron auto-resume
+            # has time to write the dashboards instead of being SIGTERM'd
+            # mid-page-create.
+            if _remaining_budget() < DASHBOARD_RESERVE_SEC:
+                _LOGGER.warning(
+                    "%s mirror: time budget reached at %d/%d, stopping early. "
+                    "Next cron run will resume via dedup.",
+                    kind_label, idx - 1, total,
+                )
+                stopped_early = True
+                break
             xid = int(x.get("id", 0))
             pct = (idx / total * 100) if total else 100.0
             try:
@@ -948,7 +979,23 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 📖 매월 성장 스토리 / 🌟 마일스톤 / 🌱 분기 관심사 / 💌 감사 카드
     # ---- (LLM-driven; auto-skipped when Ollama isn't reachable) ----
-    if mirror is not None and reports:
+    #
+    # Cron auto-resume: regenerating the 4 LLM dashboards costs ~1.5 hours
+    # of Ollama time. With the workflow on a 4-hour cron schedule we don't
+    # want to burn that on every run; only do it when there's actually new
+    # content to incorporate, or when the user explicitly asked for a
+    # refresh. Idle cron runs (no new alimnotas) finish in ~1 min.
+    new_pages_published = len(publish_results)
+    should_run_llm_dashboards = (
+        mirror is not None and reports
+        and (new_pages_published > 0 or args.force_refresh)
+    )
+    if mirror is not None and reports and not should_run_llm_dashboards:
+        _LOGGER.info(
+            "LLM dashboards: skipping (no new alimnotas added this run; "
+            "set force_refresh=true to force regeneration)"
+        )
+    if should_run_llm_dashboards:
         cname = (reports[0].get("child_name") or "") if reports else ""
 
         # Group by month + quarter
@@ -968,38 +1015,75 @@ def main(argv: list[str] | None = None) -> int:
             except (ValueError, TypeError):
                 pass
 
-        _LOGGER.info("📖 Growth story: %d months", len(by_month))
-        try:
-            res = mirror.publish_growth_story(by_month, cname)
-            _LOGGER.info("📖 Growth story page: %s",
-                         "OK" if res else "FAILED (see WARNING above for cause)")
-        except Exception as e:
-            _LOGGER.warning("growth story publish failed: %s", e)
+        # Each LLM dashboard checks the time budget before starting — if
+        # we're close to the 6h cap (e.g. force_refresh re-published a
+        # lot of alimnotas), the heavy ones get deferred to the next
+        # cron run instead of being SIGTERM'd mid-page-create.
+        MIN_BUDGET_FAST = 60   # 1 min for quick dashboards
+        MIN_BUDGET_SLOW = 900  # 15 min — heuristic for big LLM ones
 
-        _LOGGER.info("🌟 Milestones: scanning %d reports...", len(reports))
-        try:
-            res = mirror.publish_milestones(reports, cname)
-            _LOGGER.info("🌟 Milestones page: %s",
-                         "OK" if res else "FAILED (see WARNING above for cause)")
-        except Exception as e:
-            _LOGGER.warning("milestones publish failed: %s", e)
+        if _remaining_budget() < MIN_BUDGET_SLOW:
+            _LOGGER.warning(
+                "📖 Growth story: skipped (low time budget %.0fs, "
+                "next cron run will retry)", _remaining_budget(),
+            )
+        else:
+            _LOGGER.info("📖 Growth story: %d months", len(by_month))
+            try:
+                res = mirror.publish_growth_story(by_month, cname)
+                _LOGGER.info("📖 Growth story page: %s",
+                             "OK" if res else "FAILED (see WARNING above for cause)")
+            except Exception as e:
+                _LOGGER.warning("growth story publish failed: %s", e)
 
-        _LOGGER.info("🌱 Interests: %d quarters", len(by_quarter))
-        try:
-            res = mirror.publish_interests(by_quarter, cname)
-            _LOGGER.info("🌱 Interests page: %s",
-                         "OK" if res else "FAILED (see WARNING above for cause)")
-        except Exception as e:
-            _LOGGER.warning("interests publish failed: %s", e)
+        if _remaining_budget() < MIN_BUDGET_SLOW:
+            _LOGGER.warning(
+                "🌟 Milestones: skipped (low time budget %.0fs)",
+                _remaining_budget(),
+            )
+        else:
+            _LOGGER.info("🌟 Milestones: scanning %d reports...", len(reports))
+            try:
+                res = mirror.publish_milestones(reports, cname)
+                _LOGGER.info("🌟 Milestones page: %s",
+                             "OK" if res else "FAILED (see WARNING above for cause)")
+            except Exception as e:
+                _LOGGER.warning("milestones publish failed: %s", e)
 
-        _LOGGER.info("💌 Teacher thanks: composing letter...")
-        try:
-            res = mirror.publish_teacher_thanks(reports, cname)
-            _LOGGER.info("💌 Teacher thanks page: %s",
-                         "OK" if res else "FAILED (see WARNING above; or no teacher posts)")
-        except Exception as e:
-            _LOGGER.warning("teacher thanks publish failed: %s", e)
+        if _remaining_budget() < MIN_BUDGET_FAST:
+            _LOGGER.warning(
+                "🌱 Interests: skipped (low time budget %.0fs)",
+                _remaining_budget(),
+            )
+        else:
+            _LOGGER.info("🌱 Interests: %d quarters", len(by_quarter))
+            try:
+                res = mirror.publish_interests(by_quarter, cname)
+                _LOGGER.info("🌱 Interests page: %s",
+                             "OK" if res else "FAILED (see WARNING above for cause)")
+            except Exception as e:
+                _LOGGER.warning("interests publish failed: %s", e)
 
+        if _remaining_budget() < MIN_BUDGET_FAST:
+            _LOGGER.warning(
+                "💌 Teacher thanks: skipped (low time budget %.0fs)",
+                _remaining_budget(),
+            )
+        else:
+            _LOGGER.info("💌 Teacher thanks: composing letter...")
+            try:
+                res = mirror.publish_teacher_thanks(reports, cname)
+                _LOGGER.info("💌 Teacher thanks page: %s",
+                             "OK" if res else "FAILED (see WARNING above; or no teacher posts)")
+            except Exception as e:
+                _LOGGER.warning("teacher thanks publish failed: %s", e)
+
+    _LOGGER.info(
+        "Run complete. Elapsed %.0fs (%.1fh). New pages published this run: %d.",
+        time.monotonic() - _START_TIME,
+        (time.monotonic() - _START_TIME) / 3600,
+        len(publish_results),
+    )
     return 0
 
 
