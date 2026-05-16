@@ -972,7 +972,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = mirror.publish_growth_story(by_month, cname)
             _LOGGER.info("📖 Growth story page: %s",
-                         "OK" if res else "skipped (Ollama unavailable)")
+                         "OK" if res else "FAILED (see WARNING above for cause)")
         except Exception as e:
             _LOGGER.warning("growth story publish failed: %s", e)
 
@@ -980,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = mirror.publish_milestones(reports, cname)
             _LOGGER.info("🌟 Milestones page: %s",
-                         "OK" if res else "skipped (Ollama unavailable)")
+                         "OK" if res else "FAILED (see WARNING above for cause)")
         except Exception as e:
             _LOGGER.warning("milestones publish failed: %s", e)
 
@@ -988,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = mirror.publish_interests(by_quarter, cname)
             _LOGGER.info("🌱 Interests page: %s",
-                         "OK" if res else "skipped (Ollama unavailable)")
+                         "OK" if res else "FAILED (see WARNING above for cause)")
         except Exception as e:
             _LOGGER.warning("interests publish failed: %s", e)
 
@@ -996,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = mirror.publish_teacher_thanks(reports, cname)
             _LOGGER.info("💌 Teacher thanks page: %s",
-                         "OK" if res else "skipped (Ollama unavailable or no teacher posts)")
+                         "OK" if res else "FAILED (see WARNING above; or no teacher posts)")
         except Exception as e:
             _LOGGER.warning("teacher thanks publish failed: %s", e)
 

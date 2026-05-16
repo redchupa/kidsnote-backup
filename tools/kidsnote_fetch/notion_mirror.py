@@ -2762,6 +2762,12 @@ class NotionMirror:
             props[self._prop_date] = {
                 "date": {"start": datetime.now().date().isoformat()},
             }
+        # Notion caps page-create children to 100. If we have more
+        # blocks (e.g. 345-alimnota milestone page), create the page
+        # with the first 100 and PATCH the rest in chunks.
+        NOTION_PAGE_CHILDREN_CAP = 100
+        initial = blocks[:NOTION_PAGE_CHILDREN_CAP]
+        overflow = blocks[NOTION_PAGE_CHILDREN_CAP:]
         try:
             r = self.session.post(
                 f"{NOTION_API}/pages",
@@ -2769,15 +2775,38 @@ class NotionMirror:
                 json={
                     "parent": {"database_id": self.database_id},
                     "properties": props,
-                    "children": blocks,
+                    "children": initial,
                 },
                 timeout=self.timeout,
             )
             r.raise_for_status()
-            return r.json()
+            page = r.json()
         except Exception as e:
             _LOGGER.warning("singleton page publish failed (%s): %s", title, e)
             return None
+        if not overflow:
+            return page
+        page_id = page.get("id")
+        if not page_id:
+            return page
+        # Append remaining blocks in 100-children chunks
+        for i in range(0, len(overflow), NOTION_PAGE_CHILDREN_CAP):
+            chunk = overflow[i:i + NOTION_PAGE_CHILDREN_CAP]
+            try:
+                r2 = self.session.patch(
+                    f"{NOTION_API}/blocks/{page_id}/children",
+                    headers=self._headers(),
+                    json={"children": chunk},
+                    timeout=self.timeout,
+                )
+                r2.raise_for_status()
+            except Exception as e:
+                _LOGGER.warning(
+                    "singleton overflow chunk %d-%d failed (%s): %s",
+                    i, i + len(chunk), title, e,
+                )
+                break
+        return page
 
     def publish_growth_story(
         self,
@@ -2834,20 +2863,30 @@ class NotionMirror:
                 final_labels=("성장 스토리:",),
             )
             if not story:
+                _LOGGER.warning("growth story for %s: empty LLM output, skipping", ym)
                 continue
-            # Example-bleed guard: when a sparse month's alimnota has too
-            # little for the model to anchor on, it copies the example
-            # output's activities verbatim (피아노/발레/자화상/음악교실/
-            # 미술시간 — none of these would legitimately appear in
-            # daycare alimnota). Skip the month rather than emit a
-            # plausibly-real but fully fictional story.
+            # Example-bleed guard. Previously we dropped the whole month
+            # when one of 피아노/발레/자화상/음악교실/미술시간 leaked from
+            # the few-shot example. That sometimes wiped EVERY month
+            # (full-year run), leaving the page empty. Switch to a
+            # softer guard: redact the offending tokens but keep the
+            # rest of the story rather than drop the whole paragraph.
             BLEED_TOKENS = ("피아노", "발레", "자화상", "음악교실", "미술시간")
             if any(tok in story for tok in BLEED_TOKENS):
+                leaked = [t for t in BLEED_TOKENS if t in story]
                 _LOGGER.warning(
-                    "growth story for %s leaked example tokens (%s) — skipping",
-                    ym, ", ".join(t for t in BLEED_TOKENS if t in story),
+                    "growth story for %s leaked example tokens (%s) — redacting",
+                    ym, ", ".join(leaked),
                 )
-                continue
+                # Drop the entire sentence containing each leaked token
+                cleaned_sents = []
+                for sent in story.replace("<br>", "\n").split("\n"):
+                    if not any(tok in sent for tok in BLEED_TOKENS):
+                        cleaned_sents.append(sent)
+                story = "\n".join(cleaned_sents).strip()
+                if len(story) < 30:
+                    _LOGGER.warning("growth story for %s: too short after redaction, skipping", ym)
+                    continue
             blocks.append({
                 "object": "block",
                 "type": "heading_2",
@@ -2874,9 +2913,24 @@ class NotionMirror:
         """
         if _get_ollama() is None:
             return None
+        # Subsample to keep both Ollama call count and Notion block count
+        # within reason. A full year produces 300+ reports; analysing each
+        # one separately overruns the Notion 100-children page cap and
+        # exhausts Ollama after a few hours. Sample uniformly across the
+        # date-sorted list: cap at 120 reports total, distributed across
+        # the available date range so months stay represented.
+        SAMPLE_CAP = 120
+        ordered_all = sorted(reports, key=lambda r: (r.get("date_written") or ""))
+        if len(ordered_all) > SAMPLE_CAP:
+            step = len(ordered_all) / SAMPLE_CAP
+            ordered = [ordered_all[int(i * step)] for i in range(SAMPLE_CAP)]
+            sampled_note = f" (전체 {len(ordered_all)}개 중 {SAMPLE_CAP}개 균등 샘플)"
+        else:
+            ordered = ordered_all
+            sampled_note = ""
         intro = (
             f"마지막 갱신: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-            f"알림장 {len(reports)}개를 분석해 자녀의 발달 마일스톤(처음 ...)을 추출했습니다."
+            f"알림장 {len(ordered)}개를 분석해 자녀의 발달 마일스톤(처음 ...)을 추출했습니다{sampled_note}."
         )
         blocks: list[dict[str, Any]] = [{
             "object": "block",
@@ -2887,8 +2941,6 @@ class NotionMirror:
                 "color": "yellow_background",
             },
         }]
-        # Sort oldest → newest so milestones read chronologically
-        ordered = sorted(reports, key=lambda r: (r.get("date_written") or ""))
         seen_milestones: set[str] = set()
         for r in ordered:
             body = (r.get("content") or "").strip()
@@ -3073,11 +3125,16 @@ class NotionMirror:
             f"발췌:\n{joined}\n"
             "편지:"
         )
+        # Bumped from 180s — full-year teacher letter with 25 bullets has
+        # to compose a 4-5 sentence summary which takes llama3.1:8b on CPU
+        # ~4-7 min in practice. 180s was hitting timeout, returning None,
+        # and the page would silently skip.
         letter = self._ask_ollama(
-            prompt, max_chars=900, num_predict=400, timeout=180,
+            prompt, max_chars=900, num_predict=400, timeout=600,
             final_labels=("편지:", "감사 편지:"),
         )
         if not letter:
+            _LOGGER.warning("teacher thanks: ollama returned empty after timeout")
             return None
         blocks: list[dict[str, Any]] = [{
             "object": "block",
