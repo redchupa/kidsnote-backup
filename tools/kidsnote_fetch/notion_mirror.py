@@ -2831,9 +2831,11 @@ class NotionMirror:
             items = reports_by_month[ym]
             if not items:
                 continue
+            # Shrunk to 2500 chars (was 4500) — llama3.1:8b on CPU was
+            # timing out at 180s with the longer context on every month.
             joined = "\n\n".join(
-                (r.get("content") or "").strip()[:300] for r in items[:30]
-            )[:4500]
+                (r.get("content") or "").strip()[:200] for r in items[:15]
+            )[:2500]
             # Skip sparse months — LLM fills with generic filler otherwise
             if len(joined.strip()) < 200:
                 continue
@@ -2859,7 +2861,7 @@ class NotionMirror:
                 "성장 스토리:"
             )
             story = self._ask_ollama(
-                prompt, max_chars=600, num_predict=300, timeout=180,
+                prompt, max_chars=600, num_predict=300, timeout=600,
                 final_labels=("성장 스토리:",),
             )
             if not story:
@@ -3047,9 +3049,10 @@ class NotionMirror:
             items = reports_by_quarter[q]
             if not items:
                 continue
+            # Shrunk from 5000 chars (was timing out llama3.1:8b on CPU)
             joined = "\n".join(
-                (r.get("content") or "").strip()[:250] for r in items[:40]
-            )[:5000]
+                (r.get("content") or "").strip()[:150] for r in items[:20]
+            )[:2500]
             given = _given_name(child_name)
             prompt = (
                 f"다음은 어린이집 자녀의 {q} 분기 알림장 모음이야. "
@@ -3062,10 +3065,11 @@ class NotionMirror:
                 f"알림장:\n{joined}\n\nTOP 5:"
             )
             top = self._ask_ollama(
-                prompt, max_chars=400, num_predict=200, timeout=120,
+                prompt, max_chars=400, num_predict=200, timeout=600,
                 final_labels=("TOP 5:", "Top 5:"),
             )
             if not top:
+                _LOGGER.warning("interests for %s: empty LLM output, skipping", q)
                 continue
             blocks.append({
                 "object": "block",
@@ -3097,16 +3101,16 @@ class NotionMirror:
         ]
         if not teacher_reports:
             return None
-        # Most-recent first, take up to 25 with tight per-report quota
-        # (older code took 60 * 300 chars = 8000 — model copy-pasted the
-        # input instead of summarizing. Shrink to 25 * 100 = ~2500.)
+        # Most-recent first, take up to 15 with tight per-report quota.
+        # (Earlier code 60×300=8000 made model copy-paste; then 25×100=2500
+        # caused 10-min timeouts even at 600s. Now 15×80=1200 to fit CPU.)
         teacher_reports = sorted(
             teacher_reports, key=lambda r: r.get("date_written") or "", reverse=True,
-        )[:25]
+        )[:15]
         joined = "\n".join(
-            "- " + (r.get("content") or "").strip()[:100]
+            "- " + (r.get("content") or "").strip()[:80]
             for r in teacher_reports
-        )[:2500]
+        )[:1500]
         given = _given_name(child_name) or "아이"
         prompt = (
             f"다음은 어린이집 선생님이 자녀({given})에 대해 1년간 쓴 "
@@ -3125,12 +3129,11 @@ class NotionMirror:
             f"발췌:\n{joined}\n"
             "편지:"
         )
-        # Bumped from 180s — full-year teacher letter with 25 bullets has
-        # to compose a 4-5 sentence summary which takes llama3.1:8b on CPU
-        # ~4-7 min in practice. 180s was hitting timeout, returning None,
-        # and the page would silently skip.
+        # 1200s timeout — 600s also hit the wall on full-year context.
+        # Combined with shrunk input (15 bullets × 80 chars = 1200), this
+        # should land comfortably inside the budget.
         letter = self._ask_ollama(
-            prompt, max_chars=900, num_predict=400, timeout=600,
+            prompt, max_chars=900, num_predict=400, timeout=1200,
             final_labels=("편지:", "감사 편지:"),
         )
         if not letter:
