@@ -50,6 +50,31 @@ def normalize_notion_id(value: str | None) -> str:
     return ids[-1].replace("-", "").lower() if ids else ""
 
 
+def safe_url(url: str) -> str:
+    """Shorten a media URL to host + last path segment for logs.
+
+    Kidsnote media live on a public CDN (``up-kids-kage.kakao.com/dn/<key>/…``)
+    where the path itself is the access key: anyone holding it can open the
+    photo without logging in, and the run logs of a public fork are public.
+    So logs get only the host and the file's last segment (``img.jpg``,
+    ``video_high.mp4``), never the key or a query string.
+    """
+    if not isinstance(url, str):
+        return str(url)
+    parts = urlsplit(url)
+    last = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    return f"{parts.netloc}/…/{last}" if parts.netloc else "…"
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>)]+")
+
+
+def safe_err(err: BaseException) -> str:
+    """``str(err)`` with every URL shortened by ``safe_url``. requests puts the
+    full URL in its messages (``404 Client Error: … for url: https://…``)."""
+    return _URL_IN_TEXT.sub(lambda m: safe_url(m.group(0)), str(err))
+
+
 def mask_name(name: str | None) -> str:
     """'우하린' -> '우*린': recognizable to the parent, but not a full name in public Actions logs."""
     text = clean_secret(name)

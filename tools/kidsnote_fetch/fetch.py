@@ -38,6 +38,7 @@ from urllib.parse import urlparse
 import requests
 
 from secret_input import clean_secret, mask_name  # local module
+from secret_input import safe_err as _safe_err, safe_url as _safe_url  # local module
 
 try:
     import browser_cookie3
@@ -98,18 +99,6 @@ DASHBOARD_RESERVE_SEC = 30 * 60       # 30 min reserved for dashboards
 def _remaining_budget() -> float:
     """Seconds remaining in the workflow's self-imposed time budget."""
     return TIME_BUDGET_SEC - (time.monotonic() - _START_TIME)
-
-
-def _safe_url(url: str) -> str:
-    """Strip the query string from a URL so signed-URL tokens never reach logs.
-
-    Kidsnote media URLs carry temporary signed-URL tokens that can be replayed
-    before they expire; the path/host part is fine for debugging, the query
-    string is the only sensitive bit.
-    """
-    if not isinstance(url, str):
-        return str(url)
-    return url.split("?", 1)[0]
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -485,8 +474,26 @@ def _download_attachment(
         return True
     except Exception as e:
         _LOGGER.warning("attachment %s (%s) failed in %s: %s",
-                        name, _safe_url(url), folder.name, e)
+                        name, _safe_url(url), folder.name, _safe_err(e))
         return False
+
+
+def _live_page_ids(
+    page_map: dict[int, str],
+    publish_results: list[dict[str, Any]],
+    force_refresh: bool,
+) -> dict[int, str]:
+    """kidsnote id → Notion page id for the 📥 dashboard links.
+
+    Pages created this run win. Under --force-refresh the pre-run pages are
+    archived as they get replaced, so only this run's pages are safe to link.
+    """
+    out: dict[int, str] = {} if force_refresh else dict(page_map)
+    for res in publish_results:
+        rid = res.get("report_id", res.get("item_id"))
+        if rid is not None and res.get("page_id"):
+            out[int(rid)] = res["page_id"]
+    return out
 
 
 def _resolve_secret(env: dict[str, str], key: str) -> str:
@@ -938,6 +945,8 @@ def main(argv: list[str] | None = None) -> int:
                 file_tot = res.get("files_uploaded", 0) + res.get("files_failed", 0)
                 if file_tot:
                     parts.append(f"file={res['files_uploaded']}/{file_tot}")
+                if res.get("media_links"):
+                    parts.append(f"kidsnote-link={res['media_links']}")
                 attach_str = (" " + " ".join(parts)) if parts else ""
                 _LOGGER.info(
                     "%s %5.1f%% (%d/%d) | Notion +1 id=%d%s",
@@ -1160,13 +1169,21 @@ def main(argv: list[str] | None = None) -> int:
                 if yr:
                     per_year[yr]["weather"][r["weather"]] += 1
 
-        att = {
-            "images": sum(p.get("images_uploaded", 0) for p in publish_results),
-            "videos": sum(p.get("videos_uploaded", 0) for p in publish_results),
-            "videos_skipped": sum(p.get("videos_failed", 0) for p in publish_results),
-            "files": sum(p.get("files_uploaded", 0) for p in publish_results),
-            "files_skipped": sum(p.get("files_failed", 0) for p in publish_results),
-        }
+        # 📎 totals + the 📥 list of files Notion can't hold, counted from the
+        # kidsnote metadata of everything fetched (not just this run's
+        # uploads, which reset to 0 on every quiet 6-hourly run).
+        from notion_mirror import attachment_stats
+        att = attachment_stats(
+            [("알림장", reports), ("공지", notices), ("앨범", albums)],
+            _live_page_ids(page_map, publish_results, args.force_refresh),
+            mirror.max_image_bytes,
+        )
+        _LOGGER.info(
+            "📎 attachments: %d photos, %d videos, %d files; %d over the %s Notion limit "
+            "(listed with kidsnote links on the 📊 dashboard)",
+            att["images"], att["videos"], att["files"], len(att["oversized"]),
+            f"{mirror.max_image_bytes / 1_000_000:g}MB",
+        )
 
         # Per-year stats payload (newest first)
         per_year_payload: list[dict[str, Any]] = []

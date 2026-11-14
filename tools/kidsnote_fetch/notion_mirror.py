@@ -34,6 +34,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from secret_input import clean_secret, normalize_notion_id, normalize_token  # local module
+from secret_input import safe_err as _safe_err, safe_url as _safe_url  # local module
 
 
 def _build_retrying_session() -> requests.Session:
@@ -420,19 +421,6 @@ def _looks_like_input_copy(output: str, input_text: str) -> bool:
     return out_n[:25] in body_n
 
 
-def _safe_url(url: str) -> str:
-    """Strip query string from a URL so signed-URL tokens never reach logs.
-
-    Kidsnote media URLs carry temporary signed-URL tokens (S3-style ``?Signature=…``)
-    that can be replayed before they expire. The path/host part is fine for
-    debugging which asset failed; the query string is the only sensitive bit,
-    so drop it.
-    """
-    if not isinstance(url, str):
-        return str(url)
-    return url.split("?", 1)[0]
-
-
 def compress_image_to_bytes(
     raw: bytes,
     target_bytes: int,
@@ -484,6 +472,139 @@ NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 DEFAULT_MAX_IMAGE_BYTES = 5_000_000   # Notion free-tier per-file cap.
 MAX_BLOCK_TEXT = 1900                 # Notion paragraph rich_text limit (2000).
+NOTION_PAGE_CHILDREN_CAP = 100        # Notion: max children per create/append call.
+
+
+# ---------------------------------------------------------------- attachments
+#
+# Videos and generic files are uploaded as-is, so anything over the Notion
+# per-file cap can't go in. Instead of dropping it silently, the page (and the
+# 📊 dashboard) carries a link to the kidsnote original. Live-checked
+# 2026-11-15: every attachment object carries ``file_size`` (bytes), and its
+# URLs are permanent public Kakao CDN links (``up-kids-kage.kakao.com/dn/…``,
+# no query string, no login needed, 2025 links still answer 200).
+
+def media_url(obj: dict[str, Any]) -> str:
+    """The best-quality URL of one attachment object ('' when it has none).
+
+    Videos have no ``original`` key, only ``high`` / ``low`` / ``preview``.
+    """
+    for key in ("original", "high", "url"):
+        url = obj.get(key)
+        if isinstance(url, str) and url:
+            return url
+    return ""
+
+
+def video_objects(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Video attachments of a report / notice / album. Kidsnote stores a single
+    object (or None) under ``attached_video``; older shapes used a list."""
+    for key in ("attached_video", "video", "attached_videos"):
+        v = item.get(key)
+        if isinstance(v, dict):
+            return [v]
+        if isinstance(v, list) and v:
+            return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def file_objects(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Generic file attachments (PDF, Excel, ...) of a report / notice / album."""
+    return [f for f in item.get("attached_files") or [] if isinstance(f, dict)]
+
+
+def media_name(obj: dict[str, Any], kind: str) -> str:
+    """Display / upload filename of an attachment."""
+    name = obj.get("original_file_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return f"{kind}_{obj.get('id', 'x')}" + (".mp4" if kind == "video" else ".bin")
+
+
+def declared_size(obj: dict[str, Any]) -> int | None:
+    """``file_size`` from kidsnote metadata, or None when missing / unusable."""
+    size = obj.get("file_size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return None
+    return size
+
+
+def cap_label(cap: int) -> str:
+    """5_000_000 → '5MB' (the per-file limit as people read it)."""
+    return f"{cap / 1_000_000:g}MB"
+
+
+def format_mb(n_bytes: int) -> str:
+    """5_946_685 → '5.9MB'. Decimal MB, matching the '5MB' cap wording."""
+    mb = n_bytes / 1_000_000
+    return f"{mb:.1f}MB" if mb < 100 else f"{mb:.0f}MB"
+
+
+def oversized_media(item: dict[str, Any], cap: int) -> list[dict[str, Any]]:
+    """Videos / files of ``item`` whose declared size is over ``cap``.
+
+    Used by the 📊 dashboard to list every file Notion can't hold, straight
+    from the kidsnote metadata, so the list covers the whole history (pages
+    published before links existed included) without re-downloading anything.
+    Each entry: ``{kind, name, size, url}``.
+    """
+    out: list[dict[str, Any]] = []
+    for kind, objs in (("video", video_objects(item)), ("file", file_objects(item))):
+        for obj in objs:
+            size = declared_size(obj)
+            if size is not None and size > cap:
+                out.append({"kind": kind, "name": media_name(obj, kind),
+                            "size": size, "url": media_url(obj)})
+    return out
+
+
+def attachment_stats(
+    sources: list[tuple[str, list[dict[str, Any]]]],
+    page_ids: dict[int, str],
+    cap: int,
+) -> dict[str, Any]:
+    """The 📊 dashboard's 📎 section, counted from kidsnote metadata.
+
+    ``sources`` is ``[(label, items), ...]`` (알림장 / 공지 / 앨범), all
+    fetched every run, so the totals are the whole history rather than
+    just this run's uploads, and ``oversized`` lists every video / file
+    Notion can't hold. ``page_ids`` maps a kidsnote id to its Notion page,
+    so the list can link back to the page the file belongs to.
+    """
+    images = videos = files = 0
+    oversized: list[dict[str, Any]] = []
+    for label, items in sources:
+        for item in items:
+            images += sum(1 for x in item.get("attached_images") or [] if isinstance(x, dict))
+            videos += len(video_objects(item))
+            files += len(file_objects(item))
+            over = oversized_media(item, cap)
+            if not over:
+                continue
+            date = str(item.get("date_written") or item.get("created") or "")[:10]
+            try:
+                page_id = page_ids.get(int(item.get("id") or 0), "")
+            except (TypeError, ValueError):
+                page_id = ""
+            for o in over:
+                oversized.append({**o, "date": date, "source": label, "page_id": page_id})
+    return {"images": images, "videos": videos, "files": files,
+            "oversized": oversized, "cap": cap}
+
+
+def _is_linkable(url: str) -> bool:
+    """Notion rejects the whole page for a malformed link, so only plain
+    http(s) URLs within its 2000-char limit become links."""
+    return (
+        isinstance(url, str)
+        and url.startswith(("https://", "http://"))
+        and len(url) <= 2000
+        and not any(c.isspace() for c in url)
+    )
+
+
+def notion_page_url(page_id: str) -> str:
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 # Kidsnote life-record status codes → human Korean. Unknown values are
 # rendered as-is, so missing entries here just degrade gracefully.
@@ -1042,7 +1163,7 @@ class NotionMirror:
                         filename_hint, type(e).__name__,
                     )
                     continue
-                _LOGGER.warning("file upload PUT failed for %s: %s", filename_hint, e)
+                _LOGGER.warning("file upload PUT failed for %s: %s", filename_hint, _safe_err(e))
                 return None
         return None
 
@@ -1118,10 +1239,269 @@ class NotionMirror:
             )
             r.raise_for_status()
         except Exception as e:
-            _LOGGER.warning("%s upload PUT failed for %s: %s", kind, filename, e)
+            _LOGGER.warning("%s upload PUT failed for %s: %s", kind, filename, _safe_err(e))
             return None
 
         return file_upload_id
+
+    def _upload_blob_or_link(
+        self,
+        obj: dict[str, Any],
+        kidsnote_sess: requests.Session,
+        kind: str,  # "video" or "file"
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Upload one video / file, or say why not.
+
+        Returns ``(file_upload_id, None)`` on success, ``(None, link)`` when it
+        can't go into Notion but the page should link the kidsnote original,
+        and ``(None, None)`` when there is nothing to link (no URL at all).
+        ``link`` is ``{kind, name, size, url, reason}`` with reason
+        ``"too_big"`` (over the per-file cap) or ``"failed"``.
+
+        Over-cap files are recognised from kidsnote's ``file_size`` before
+        downloading, so a 50MB video isn't fetched just to be thrown away.
+        """
+        url = media_url(obj)
+        name = media_name(obj, kind)
+        size = declared_size(obj)
+        if not url:
+            return None, None
+
+        def link(reason: str, n_bytes: int | None) -> dict[str, Any]:
+            return {"kind": kind, "name": name, "size": n_bytes, "url": url, "reason": reason}
+
+        if size is not None and size > self.max_image_bytes:
+            _LOGGER.info(
+                "%s %s is %s, over the %s Notion file limit: linking the kidsnote original instead",
+                kind, name, format_mb(size), cap_label(self.max_image_bytes),
+            )
+            return None, link("too_big", size)
+        try:
+            resp = kidsnote_sess.get(url, timeout=180)
+            resp.raise_for_status()
+            raw = resp.content
+        except Exception as e:
+            _LOGGER.warning("%s download failed (%s): %s", kind, _safe_url(url), _safe_err(e))
+            return None, link("failed", size)
+        if len(raw) > self.max_image_bytes:
+            _LOGGER.info(
+                "%s %s is %s, over the %s Notion file limit: linking the kidsnote original instead",
+                kind, name, format_mb(len(raw)), cap_label(self.max_image_bytes),
+            )
+            return None, link("too_big", len(raw))
+        fid = self._upload_one_blob(raw, name, kind=kind)
+        if fid:
+            return fid, None
+        return None, link("failed", len(raw))
+
+    def _upload_media(
+        self,
+        item: dict[str, Any],
+        kidsnote_sess: requests.Session,
+    ) -> dict[str, Any]:
+        """Upload every photo / video / file of a report, notice or album.
+
+        Returns ``{image_ids, images_failed, video_ids, videos_failed,
+        file_ids, files_failed, links}``; ``file_ids`` holds ``(id, name)``
+        pairs and ``links`` the videos / files that stay on kidsnote (see
+        ``_upload_blob_or_link``).
+        """
+        image_ids: list[str] = []
+        images_failed = 0
+        for img in item.get("attached_images") or []:
+            if not isinstance(img, dict):
+                continue
+            url = (
+                img.get("original")
+                or img.get("high_resize")
+                or img.get("large")
+                or img.get("url")
+            )
+            if not url:
+                images_failed += 1
+                continue
+            try:
+                resp = kidsnote_sess.get(url, timeout=120)
+                resp.raise_for_status()
+                raw_bytes = resp.content
+            except Exception as e:
+                _LOGGER.warning("photo download failed (%s): %s", _safe_url(url), _safe_err(e))
+                images_failed += 1
+                continue
+            hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
+            fid = self._upload_one_image(raw_bytes, hint)
+            if fid:
+                image_ids.append(fid)
+            else:
+                images_failed += 1
+
+        out: dict[str, Any] = {
+            "image_ids": image_ids, "images_failed": images_failed,
+            "video_ids": [], "videos_failed": 0,
+            "file_ids": [], "files_failed": 0,
+            "links": [],
+        }
+        for kind, objs in (("video", video_objects(item)), ("file", file_objects(item))):
+            for obj in objs:
+                fid, link = self._upload_blob_or_link(obj, kidsnote_sess, kind)
+                if fid and kind == "video":
+                    out["video_ids"].append(fid)
+                elif fid:
+                    out["file_ids"].append((fid, media_name(obj, kind)))
+                else:
+                    out[f"{kind}s_failed"] += 1
+                    if link:
+                        out["links"].append(link)
+        return out
+
+    def _media_link_blocks(
+        self,
+        links: list[dict[str, Any]],
+        *,
+        how_to: bool = True,
+    ) -> list[dict[str, Any]]:
+        """One bullet per file left on kidsnote, after a gray how-to line
+        (``how_to=False`` when the page already showed it)."""
+        if not links:
+            return []
+        blocks: list[dict[str, Any]] = []
+        if how_to:
+            blocks.append(self._para(
+                "노션에 올리지 못한 파일은 키즈노트 원본 링크로 남겨요. "
+                "파일 이름을 누르면 보거나 저장할 수 있어요.",
+                color="gray",
+            ))
+        for ln in links:
+            rich: list[dict[str, Any]] = [{"type": "text", "text": {"content": "📥 "}}]
+            name_rt: dict[str, Any] = {"content": ln["name"][:200]}
+            if _is_linkable(ln.get("url") or ""):
+                name_rt["link"] = {"url": ln["url"]}
+            rich.append({"type": "text", "text": name_rt})
+            tail = []
+            if ln.get("size"):
+                tail.append(format_mb(ln["size"]))
+            if ln.get("reason") == "too_big":
+                tail.append(f"노션 무료 요금제 한도({cap_label(self.max_image_bytes)}) 초과")
+            else:
+                tail.append("노션 업로드 실패")
+            rich.append({
+                "type": "text",
+                "text": {"content": " · " + " · ".join(tail)},
+                "annotations": {"color": "gray"},
+            })
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": rich},
+            })
+        return blocks
+
+    def _attachment_blocks(
+        self,
+        image_ids: list[str],
+        video_ids: list[str],
+        file_ids: list[tuple[str, str]],
+        links: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """사진 / 동영상 / 첨부 파일 sections. A section also appears when all
+        its files stayed on kidsnote, so the links have a place to live."""
+        links = links or []
+        video_links = [ln for ln in links if ln["kind"] == "video"]
+        file_links = [ln for ln in links if ln["kind"] == "file"]
+
+        def heading(text: str) -> dict[str, Any]:
+            return {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+            }
+
+        blocks: list[dict[str, Any]] = []
+        if image_ids:
+            blocks.append(heading("사진"))
+            for fid in image_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "image",
+                    "image": {"type": "file_upload", "file_upload": {"id": fid}},
+                })
+        if video_ids or video_links:
+            blocks.append(heading("동영상"))
+            for fid in video_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "video",
+                    "video": {"type": "file_upload", "file_upload": {"id": fid}},
+                })
+            blocks.extend(self._media_link_blocks(video_links))
+        if file_ids or file_links:
+            blocks.append(heading("첨부 파일"))
+            for fid, fname in file_ids:
+                blocks.append({
+                    "object": "block",
+                    "type": "file",
+                    "file": {
+                        "type": "file_upload",
+                        "file_upload": {"id": fid},
+                        "name": fname[:100],
+                    },
+                })
+            blocks.extend(self._media_link_blocks(file_links, how_to=not video_links))
+        return blocks
+
+    def _create_page(
+        self,
+        properties: dict[str, Any],
+        children: list[dict[str, Any]],
+        *,
+        all_or_nothing: bool = True,
+    ) -> dict[str, Any]:
+        """POST /pages with up to 100 children, then append the rest in
+        100-block chunks (Notion rejects a create with more than 100).
+        Raises when the page itself can't be created.
+
+        ``all_or_nothing`` (report / notice / album / menu pages): if an
+        append fails, the half-built page is archived and the error raised,
+        because dedup skips any id already in the DB, so a partial page would
+        never be completed. Dashboards are rebuilt every run and pass False
+        to keep whatever landed."""
+        r = self.session.post(
+            f"{NOTION_API}/pages",
+            headers=self._headers(),
+            json={
+                "parent": {"database_id": self.database_id},
+                "properties": properties,
+                "children": children[:NOTION_PAGE_CHILDREN_CAP],
+            },
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        page = r.json()
+        rest = children[NOTION_PAGE_CHILDREN_CAP:]
+        page_id = page.get("id")
+        for i in range(0, len(rest), NOTION_PAGE_CHILDREN_CAP):
+            if not page_id:
+                break
+            chunk = rest[i:i + NOTION_PAGE_CHILDREN_CAP]
+            try:
+                r2 = self.session.patch(
+                    f"{NOTION_API}/blocks/{page_id}/children",
+                    headers=self._headers(),
+                    json={"children": chunk},
+                    timeout=self.timeout,
+                )
+                r2.raise_for_status()
+            except Exception as e:
+                _LOGGER.warning(
+                    "page %s: appending blocks %d-%d failed: %s",
+                    page_id, NOTION_PAGE_CHILDREN_CAP + i,
+                    NOTION_PAGE_CHILDREN_CAP + i + len(chunk), _safe_err(e),
+                )
+                if all_or_nothing:
+                    self._archive_page(page_id)
+                    raise
+                break
+        return page
 
     # ----------------------------------------------------------- page build
 
@@ -1223,6 +1603,7 @@ class NotionMirror:
         image_upload_ids: list[str],
         video_upload_ids: list[str],
         file_upload_ids: list[tuple[str, str]],  # list of (id, filename)
+        media_links: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
@@ -1339,57 +1720,10 @@ class NotionMirror:
             for chunk in self._chunk(body):
                 blocks.append(self._para(chunk))
 
-        # Photos (one image block per uploaded file)
-        if image_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "사진"}}]},
-            })
-            for fid in image_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "image",
-                    "image": {
-                        "type": "file_upload",
-                        "file_upload": {"id": fid},
-                    },
-                })
-
-        # Videos (only those that fit Notion's per-file cap)
-        if video_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "동영상"}}]},
-            })
-            for fid in video_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "video",
-                    "video": {
-                        "type": "file_upload",
-                        "file_upload": {"id": fid},
-                    },
-                })
-
-        # Generic file attachments (PDF, Excel, etc.)
-        if file_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "첨부 파일"}}]},
-            })
-            for fid, fname in file_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "file",
-                    "file": {
-                        "type": "file_upload",
-                        "file_upload": {"id": fid},
-                        "name": fname[:100],
-                    },
-                })
+        # 사진 / 동영상 / 첨부 파일 (+ links to files left on kidsnote)
+        blocks.extend(self._attachment_blocks(
+            image_upload_ids, video_upload_ids, file_upload_ids, media_links,
+        ))
 
         return blocks
 
@@ -2268,7 +2602,7 @@ class NotionMirror:
                 resp.raise_for_status()
                 raw = resp.content
             except Exception as e:
-                _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), e)
+                _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), _safe_err(e))
                 continue
             hint = img.get("original_file_name") or f"menu_{text_field}.jpg"
             fid = self._upload_one_image(raw, hint)
@@ -2466,100 +2800,12 @@ class NotionMirror:
         # the dashboards (_5/_4) and albums (_3), above notices (_1).
         title = f"_2 [{date_str}] 알림장: {prefix_emojis} {tail}"
 
-        # Upload photos first so we can drop image blocks into the page body.
-        image_upload_ids: list[str] = []
-        images_failed = 0
-        for img in report.get("attached_images") or []:
-            if not isinstance(img, dict):
-                continue
-            url = (
-                img.get("original")
-                or img.get("high_resize")
-                or img.get("large")
-                or img.get("url")
-            )
-            if not url:
-                images_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=120)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("photo download failed (%s): %s", _safe_url(url), e)
-                images_failed += 1
-                continue
-            hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
-            fid = self._upload_one_image(raw_bytes, hint)
-            if fid:
-                image_upload_ids.append(fid)
-            else:
-                images_failed += 1
-
-        # Videos: kidsnote stores it as a single object (or None / list of 1).
-        # Notion's per-file cap (5 MiB free) applies; over-cap videos are skipped.
-        video_upload_ids: list[str] = []
-        videos_failed = 0
-        video_objs: list[dict[str, Any]] = []
-        for k in ("attached_video", "video", "attached_videos"):
-            v = report.get(k)
-            if isinstance(v, dict):
-                video_objs.append(v)
-                break
-            if isinstance(v, list) and v:
-                video_objs.extend(x for x in v if isinstance(x, dict))
-                break
-        for vobj in video_objs:
-            url = (
-                vobj.get("original")
-                or vobj.get("high")
-                or vobj.get("url")
-            )
-            if not url:
-                videos_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=180)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("video download failed (%s): %s", _safe_url(url), e)
-                videos_failed += 1
-                continue
-            hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
-            fid = self._upload_one_blob(raw_bytes, hint, kind="video")
-            if fid:
-                video_upload_ids.append(fid)
-            else:
-                videos_failed += 1
-
-        # Other file attachments (PDF, Excel, etc.) — same 5 MiB cap.
-        file_upload_ids: list[tuple[str, str]] = []
-        files_failed = 0
-        for fobj in report.get("attached_files") or []:
-            if not isinstance(fobj, dict):
-                continue
-            url = fobj.get("original") or fobj.get("url")
-            if not url:
-                files_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=180)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("file download failed (%s): %s", _safe_url(url), e)
-                files_failed += 1
-                continue
-            hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
-            fid = self._upload_one_blob(raw_bytes, hint, kind="file")
-            if fid:
-                file_upload_ids.append((fid, hint))
-            else:
-                files_failed += 1
+        # Upload photos / videos / files first so the page body can embed them.
+        media = self._upload_media(report, kidsnote_sess)
 
         children = self._build_children(
-            report, image_upload_ids, video_upload_ids, file_upload_ids,
+            report, media["image_ids"], media["video_ids"], media["file_ids"],
+            media["links"],
         )
 
         # Append life-record chips to the meta paragraph (first gray paragraph).
@@ -2615,30 +2861,13 @@ class NotionMirror:
             except (ValueError, TypeError):
                 pass
 
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": properties,
-            "children": children,
-        }
-        r = self.session.post(
-            f"{NOTION_API}/pages",
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        page = r.json()
+        page = self._create_page(properties, children)
         return {
             "page_id": page.get("id", ""),
             "page_url": page.get("url", ""),
             "report_id": report_id,
             "title": title,
-            "images_uploaded": len(image_upload_ids),
-            "images_failed": images_failed,
-            "videos_uploaded": len(video_upload_ids),
-            "videos_failed": videos_failed,
-            "files_uploaded": len(file_upload_ids),
-            "files_failed": files_failed,
+            **self._media_counts(media),
         }
 
     # ----------------------------------------------------------- notice / album publish
@@ -2660,92 +2889,8 @@ class NotionMirror:
         Uses the same upload + block-building logic as ``publish_report``.
         ``comment_kind``: URL segment for the comments endpoint (notices/albums).
         """
-        # ---- Upload images ----
-        image_upload_ids: list[str] = []
-        images_failed = 0
-        for img in item.get("attached_images") or []:
-            if not isinstance(img, dict):
-                continue
-            url = (
-                img.get("original")
-                or img.get("high_resize")
-                or img.get("large")
-                or img.get("url")
-            )
-            if not url:
-                images_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=120)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("photo download failed (%s): %s", _safe_url(url), e)
-                images_failed += 1
-                continue
-            hint = img.get("original_file_name") or f"image_{img.get('id', 'x')}.jpg"
-            fid = self._upload_one_image(raw_bytes, hint)
-            if fid:
-                image_upload_ids.append(fid)
-            else:
-                images_failed += 1
-
-        # ---- Upload videos ----
-        video_upload_ids: list[str] = []
-        videos_failed = 0
-        video_objs: list[dict[str, Any]] = []
-        for k in ("attached_video", "video", "attached_videos"):
-            v = item.get(k)
-            if isinstance(v, dict):
-                video_objs.append(v)
-                break
-            if isinstance(v, list) and v:
-                video_objs.extend(x for x in v if isinstance(x, dict))
-                break
-        for vobj in video_objs:
-            url = vobj.get("original") or vobj.get("high") or vobj.get("url")
-            if not url:
-                videos_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=180)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("video download failed (%s): %s", _safe_url(url), e)
-                videos_failed += 1
-                continue
-            hint = vobj.get("original_file_name") or f"video_{vobj.get('id', 'x')}.mp4"
-            fid = self._upload_one_blob(raw_bytes, hint, kind="video")
-            if fid:
-                video_upload_ids.append(fid)
-            else:
-                videos_failed += 1
-
-        # ---- Upload generic files ----
-        file_upload_ids: list[tuple[str, str]] = []
-        files_failed = 0
-        for fobj in item.get("attached_files") or []:
-            if not isinstance(fobj, dict):
-                continue
-            url = fobj.get("original") or fobj.get("url")
-            if not url:
-                files_failed += 1
-                continue
-            try:
-                resp = kidsnote_sess.get(url, timeout=180)
-                resp.raise_for_status()
-                raw_bytes = resp.content
-            except Exception as e:
-                _LOGGER.warning("file download failed (%s): %s", _safe_url(url), e)
-                files_failed += 1
-                continue
-            hint = fobj.get("original_file_name") or f"file_{fobj.get('id', 'x')}.bin"
-            fid = self._upload_one_blob(raw_bytes, hint, kind="file")
-            if fid:
-                file_upload_ids.append((fid, hint))
-            else:
-                files_failed += 1
+        # ---- Upload photos / videos / files ----
+        media = self._upload_media(item, kidsnote_sess)
 
         # ---- Build body blocks ----
         blocks: list[dict[str, Any]] = []
@@ -2755,47 +2900,9 @@ class NotionMirror:
         if body_text:
             for chunk in self._chunk(body_text):
                 blocks.append(self._para(chunk))
-
-        if image_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "사진"}}]},
-            })
-            for fid in image_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "image",
-                    "image": {"type": "file_upload", "file_upload": {"id": fid}},
-                })
-        if video_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "동영상"}}]},
-            })
-            for fid in video_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "video",
-                    "video": {"type": "file_upload", "file_upload": {"id": fid}},
-                })
-        if file_upload_ids:
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "첨부 파일"}}]},
-            })
-            for fid, fname in file_upload_ids:
-                blocks.append({
-                    "object": "block",
-                    "type": "file",
-                    "file": {
-                        "type": "file_upload",
-                        "file_upload": {"id": fid},
-                        "name": fname[:100],
-                    },
-                })
+        blocks.extend(self._attachment_blocks(
+            media["image_ids"], media["video_ids"], media["file_ids"], media["links"],
+        ))
 
         # ---- Append comments (parent + teacher replies) at the end ----
         # comment_kind is `"notices"` or `"albums"`. Notices are center-wide
@@ -2820,29 +2927,25 @@ class NotionMirror:
                 properties[self._prop_date] = {"date": {"start": d}}
             except (ValueError, TypeError):
                 pass
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": properties,
-            "children": blocks,
-        }
-        r = self.session.post(
-            f"{NOTION_API}/pages",
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        page = r.json()
+        page = self._create_page(properties, blocks)
         return {
             "page_id": page.get("id", ""),
             "title": title,
             "item_id": item_id,
-            "images_uploaded": len(image_upload_ids),
-            "images_failed": images_failed,
-            "videos_uploaded": len(video_upload_ids),
-            "videos_failed": videos_failed,
-            "files_uploaded": len(file_upload_ids),
-            "files_failed": files_failed,
+            **self._media_counts(media),
+        }
+
+    @staticmethod
+    def _media_counts(media: dict[str, Any]) -> dict[str, int]:
+        """Per-page attachment counters the run log prints."""
+        return {
+            "images_uploaded": len(media["image_ids"]),
+            "images_failed": media["images_failed"],
+            "videos_uploaded": len(media["video_ids"]),
+            "videos_failed": media["videos_failed"],
+            "files_uploaded": len(media["file_ids"]),
+            "files_failed": media["files_failed"],
+            "media_links": len(media["links"]),
         }
 
     def publish_notice(
@@ -2993,7 +3096,7 @@ class NotionMirror:
                         else:
                             images_failed += 1
                     except Exception as e:
-                        _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), e)
+                        _LOGGER.warning("menu photo download failed (%s): %s", _safe_url(url), _safe_err(e))
                         images_failed += 1
 
         # Resolve property names + assemble payload.
@@ -3010,19 +3113,7 @@ class NotionMirror:
             except (ValueError, TypeError):
                 pass
 
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": properties,
-            "children": blocks,
-        }
-        r = self.session.post(
-            f"{NOTION_API}/pages",
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        page = r.json()
+        page = self._create_page(properties, blocks)
         return {
             "page_id": page.get("id", ""),
             "page_url": page.get("url", ""),
@@ -3169,19 +3260,8 @@ class NotionMirror:
             properties[self._prop_date] = {
                 "date": {"start": datetime.now().date().isoformat()},
             }
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": properties,
-            "children": blocks,
-        }
-        r = self.session.post(
-            f"{NOTION_API}/pages",
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        return r.json()
+        # The 📥 list can run past Notion's 100-blocks-per-create limit.
+        return self._create_page(properties, blocks, all_or_nothing=False)
 
     @staticmethod
     def _mermaid_block(code: str) -> dict[str, Any]:
@@ -3297,19 +3377,27 @@ class NotionMirror:
 
         # ---- 첨부물 통계 ----
         att = stats.get("attachments") or {}
+        oversized = att.get("oversized") or []
+        cap = cap_label(att.get("cap") or self.max_image_bytes)
         if att:
-            blocks.append(self._h2("📎 첨부물 누계"))
+            blocks.append(self._h2("📎 첨부물 누계 (키즈노트 기준)"))
+
+            def over_note(kind: str) -> str:
+                n = sum(1 for o in oversized if o.get("kind") == kind)
+                return f"  ({cap}가 넘어 원본 링크로 남긴 {n:,} 개 포함)" if n else ""
+
             lines = [
                 f"📷 사진 {att.get('images', 0):,} 장",
-                f"🎬 동영상 {att.get('videos', 0):,} 개  (5MB 이상 skip {att.get('videos_skipped', 0)} 개)",
-                f"📄 첨부파일 {att.get('files', 0):,} 개  (5MB 이상 skip {att.get('files_skipped', 0)} 개)",
+                f"🎬 동영상 {att.get('videos', 0):,} 개{over_note('video')}",
+                f"📄 첨부파일 {att.get('files', 0):,} 개{over_note('file')}",
             ]
             for line in lines:
-                blocks.append({
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": line}}]},
-                })
+                blocks.append(self._para(line))
+            if oversized:
+                blocks.append(self._para(
+                    "📥 노션에 못 올린 파일의 원본 링크는 이 페이지 맨 아래에 있어요.",
+                    color="gray",
+                ))
 
         # ---- 연도별 상세 (per-year breakdown) ----
         per_year = stats.get("per_year") or []
@@ -3372,6 +3460,58 @@ class NotionMirror:
                         )
                     ))
 
+        # ---- 📥 노션에 못 올린 파일 (last: the list can be long) ----
+        if oversized:
+            blocks.extend(self._oversized_list_blocks(oversized, cap))
+
+        return blocks
+
+    def _oversized_list_blocks(
+        self,
+        oversized: list[dict[str, Any]],
+        cap: str,
+    ) -> list[dict[str, Any]]:
+        """Dashboard list of every video / file over the Notion cap, newest
+        first: date · source (linked to its Notion page when known) · name
+        (linked to the kidsnote original) · size."""
+        blocks: list[dict[str, Any]] = [
+            self._h2(f"📥 노션에 못 올린 파일 {len(oversized):,}개"),
+            self._para(
+                f"노션 무료 요금제는 파일당 {cap}까지만 올릴 수 있어요. "
+                "파일 이름을 누르면 키즈노트 원본을 보거나 저장할 수 있어요.",
+                color="gray",
+            ),
+        ]
+        ordered = sorted(
+            oversized,
+            key=lambda o: (o.get("date") or "", o.get("name") or ""),
+            reverse=True,
+        )
+        for o in ordered:
+            rich: list[dict[str, Any]] = []
+            if o.get("date"):
+                rich.append({"type": "text", "text": {"content": f"{o['date']} · "}})
+            source: dict[str, Any] = {"content": o.get("source") or "키즈노트"}
+            if o.get("page_id"):
+                source["link"] = {"url": notion_page_url(o["page_id"])}
+            rich.append({"type": "text", "text": source})
+            icon = "🎬" if o.get("kind") == "video" else "📄"
+            rich.append({"type": "text", "text": {"content": f" · {icon} "}})
+            name: dict[str, Any] = {"content": (o.get("name") or "")[:200]}
+            if _is_linkable(o.get("url") or ""):
+                name["link"] = {"url": o["url"]}
+            rich.append({"type": "text", "text": name})
+            if o.get("size"):
+                rich.append({
+                    "type": "text",
+                    "text": {"content": f" · {format_mb(o['size'])}"},
+                    "annotations": {"color": "gray"},
+                })
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": rich},
+            })
         return blocks
 
 
@@ -3396,20 +3536,8 @@ class NotionMirror:
             properties[self._prop_date] = {
                 "date": {"start": datetime.now().date().isoformat()},
             }
-        payload = {
-            "parent": {"database_id": self.database_id},
-            "properties": properties,
-            "children": blocks,
-        }
         try:
-            r = self.session.post(
-                f"{NOTION_API}/pages",
-                headers=self._headers(),
-                json=payload,
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return r.json()
+            return self._create_page(properties, blocks, all_or_nothing=False)
         except Exception as e:
             _LOGGER.warning("nutrition publish failed: %s", e)
             return None
@@ -3526,51 +3654,13 @@ class NotionMirror:
             props[self._prop_date] = {
                 "date": {"start": datetime.now().date().isoformat()},
             }
-        # Notion caps page-create children to 100. If we have more
-        # blocks (e.g. 345-alimnota milestone page), create the page
-        # with the first 100 and PATCH the rest in chunks.
-        NOTION_PAGE_CHILDREN_CAP = 100
-        initial = blocks[:NOTION_PAGE_CHILDREN_CAP]
-        overflow = blocks[NOTION_PAGE_CHILDREN_CAP:]
+        # Notion caps page-create children to 100; _create_page appends the
+        # rest (e.g. a 345-alimnota milestone page) and keeps what landed.
         try:
-            r = self.session.post(
-                f"{NOTION_API}/pages",
-                headers=self._headers(),
-                json={
-                    "parent": {"database_id": self.database_id},
-                    "properties": props,
-                    "children": initial,
-                },
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            page = r.json()
+            return self._create_page(props, blocks, all_or_nothing=False)
         except Exception as e:
             _LOGGER.warning("singleton page publish failed (%s): %s", title, e)
             return None
-        if not overflow:
-            return page
-        page_id = page.get("id")
-        if not page_id:
-            return page
-        # Append remaining blocks in 100-children chunks
-        for i in range(0, len(overflow), NOTION_PAGE_CHILDREN_CAP):
-            chunk = overflow[i:i + NOTION_PAGE_CHILDREN_CAP]
-            try:
-                r2 = self.session.patch(
-                    f"{NOTION_API}/blocks/{page_id}/children",
-                    headers=self._headers(),
-                    json={"children": chunk},
-                    timeout=self.timeout,
-                )
-                r2.raise_for_status()
-            except Exception as e:
-                _LOGGER.warning(
-                    "singleton overflow chunk %d-%d failed (%s): %s",
-                    i, i + len(chunk), title, e,
-                )
-                break
-        return page
 
     def publish_growth_story(
         self,
