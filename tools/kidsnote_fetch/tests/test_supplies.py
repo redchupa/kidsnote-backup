@@ -9,6 +9,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -237,6 +238,47 @@ class FetchStepTest(unittest.TestCase):
         self.assertEqual(m.calls, [("reports", 1)])
         self.assertEqual({(r.source, r.page_id) for r in board.requests},
                          {("알림장", "pg"), ("선생님 댓글", "pg"), ("공지", "")})
+
+    def test_attached_documents_feed_the_board(self):
+        from test_doc_text import docx
+
+        class Resp:
+            content = docx("🍂11월 27일(금)", "- 김장 체험", "앞치마 보내주세요")
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, n):
+                yield self.content
+
+        class Sess:
+            urls: list = []
+
+            def get(self, url, timeout, stream=False):
+                self.urls.append(url)
+                return Resp()
+
+        today = date.today()
+        notice = dict(self.notices[0], attached_files=[
+            {"original_file_name": "11월 가정통신문.docx", "file_size": 3000, "original": "https://cdn/x/a.docx"},
+            {"original_file_name": "사진.jpg", "file_size": 3000, "original": "https://cdn/x/b.jpg"},
+            {"original_file_name": "huge.pdf", "file_size": 99_000_000, "original": "https://cdn/x/c.pdf"},
+        ])
+        m, sess = self.Mirror(), Sess()
+        with mock.patch("supplies.today_kst", return_value=date(today.year, 11, 20)):
+            self.fetch._publish_supplies(m, sess, [], [dict(notice, created=f"{today.year}-11-18")], {})
+        board, _ = m.published
+        self.assertEqual(sess.urls, ["https://cdn/x/a.docx"])  # only readable, size-checked files
+        self.assertIn(("첨부(11월 가정통신문.docx)", "앞치마 보내주세요"),
+                      {(r.source, r.text) for r in board.requests})
+        self.assertIn("김장 체험 / 앞치마 보내주세요", [e.text for e in board.events])
+
+        # At most SUPPLIES_MAX_ATTACHMENTS documents are re-read per run, newest first.
+        many = [dict(notice, id=100 + i, created=f"{today.year}-11-18") for i in range(20)]
+        sess.urls.clear()
+        with mock.patch("supplies.today_kst", return_value=date(today.year, 11, 20)):
+            self.fetch._publish_supplies(self.Mirror(), sess, [], many, {})
+        self.assertEqual(len(sess.urls), self.fetch.SUPPLIES_MAX_ATTACHMENTS)
 
     def test_no_comment_lookups_near_the_time_cap(self):
         from unittest import mock

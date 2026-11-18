@@ -188,6 +188,67 @@ class PublishLinksTest(unittest.TestCase):
         bullet = next(b for b in children if b["type"] == "bulleted_list_item")
         self.assertEqual(_links(bullet), [pdf["original"]])
 
+    def test_document_text_goes_into_a_toggle(self):
+        from test_doc_text import docx
+        small = {"id": 8, "original_file_name": "11월 계획안.docx", "file_size": 3000,
+                 "original": f"{self.server.url}/dn/{SECRET_KEY}/8/plan.docx"}
+        big = {"id": 9, "original_file_name": "연간 일정.docx", "file_size": 12_000_000,
+               "original": f"{self.server.url}/dn/{SECRET_KEY}/9/year.docx"}
+        self.backend.media[f"/dn/{SECRET_KEY}/8/plan.docx"] = docx("11/20 드론 체험", "준비물: 원복")
+        self.backend.media[f"/dn/{SECRET_KEY}/9/year.docx"] = docx("12월 23일 성탄 행사")
+        notice = {"id": 203, "title": "11월 안내", "content": "본문", "created": "2026-11-01T09:00:00",
+                  "attached_files": [small, big], "author": {"type": "admin"}}
+        res = self.mirror.publish_notice(notice, self.kidsnote)
+
+        # The small file is uploaded, the big one linked; both get their text read.
+        self.assertEqual((res["files_uploaded"], res["media_links"], res["doc_texts"]), (1, 1, 2))
+        children = self.backend.pages[0]["children"]
+        toggles = [b for b in children if b["type"] == "toggle"]
+        self.assertEqual([_plain(t) for t in toggles],
+                         ["📄 11월 계획안.docx — 글 내용", "📄 연간 일정.docx — 글 내용"])
+        inner = [_plain(b) for b in toggles[0]["toggle"]["children"]]
+        self.assertEqual(inner[1], "11/20 드론 체험\n준비물: 원복")
+        self.assertIn("12월 23일 성탄 행사", _plain(toggles[1]["toggle"]["children"][1]))
+
+    def test_document_text_is_capped_per_page(self):
+        toggle = self.mirror._doc_text_toggle("a.hwp", "가" * 50_000, 4000)
+        texts = [_plain(b) for b in toggle["toggle"]["children"][1:]]
+        self.assertTrue(all(len(t) <= nm.MAX_BLOCK_TEXT for t in texts))
+        self.assertTrue(texts[-1].endswith("(이후 내용은 원본 파일에서 확인하세요)"))
+        self.assertLess(sum(len(t) for t in texts), 4100)
+
+    def test_download_stops_at_the_byte_cap(self):
+        path = f"/dn/{SECRET_KEY}/5/video_high.mp4"
+        self.backend.media[path] = b"\0" * 300_000
+        sess = requests.Session()
+        self.assertIsNone(nm.fetch_capped(sess, self.server.url + path, 100_000, 30))
+        self.assertEqual(len(nm.fetch_capped(sess, self.server.url + path, 300_000, 30)), 300_000)
+
+    def test_size_unknown_and_huge_is_linked_without_keeping_it(self):
+        obj = video(1, 0, base=self.server.url)
+        del obj["file_size"]
+        self.backend.media[f"/dn/{SECRET_KEY}/1/video_high.mp4"] = b"\0" * (CAP + 10)
+        res = self.mirror.publish_report(self.report(attached_video=obj), self.kidsnote)
+        self.assertEqual((res["videos_uploaded"], res["media_links"]), (0, 1))
+        bullet = next(b for b in self.backend.pages[0]["children"] if b["type"] == "bulleted_list_item")
+        self.assertIn("초과", _plain(bullet))
+
+    def test_failed_fetch_of_an_over_cap_document_still_says_over_the_limit(self):
+        doc = {"id": 9, "original_file_name": "연간 일정.hwp", "file_size": 12_000_000,
+               "original": f"{self.server.url}/dn/{SECRET_KEY}/9/year.hwp"}
+        self.backend.missing.add(f"/dn/{SECRET_KEY}/9/year.hwp")
+        notice = {"id": 204, "title": "안내", "content": "", "created": "2026-11-01T09:00:00",
+                  "attached_files": [doc], "author": {"type": "admin"}}
+        with self.assertLogs("notion_mirror", level="WARNING"):
+            self.mirror.publish_notice(notice, self.kidsnote)
+        bullet = next(b for b in self.backend.pages[0]["children"] if b["type"] == "bulleted_list_item")
+        self.assertIn("노션 무료 요금제 한도(5MB) 초과", _plain(bullet))
+
+    def test_videos_are_still_not_downloaded_for_text(self):
+        big = video(1, 9_000_000, base=self.server.url)
+        self.mirror.publish_report(self.report(attached_video=big), self.kidsnote)
+        self.assertEqual(self.backend.downloads, [])
+
     def test_no_attachments_no_sections(self):
         self.mirror.publish_report(self.report(content="오늘은 산책"), self.kidsnote)
         types = {b["type"] for b in self.backend.pages[0]["children"]}

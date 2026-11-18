@@ -35,6 +35,7 @@ from urllib3.util.retry import Retry
 
 from secret_input import clean_secret, normalize_notion_id, normalize_token  # local module
 from secret_input import safe_err as _safe_err, safe_url as _safe_url  # local module
+import doc_text  # local module
 
 
 def _build_retrying_session() -> requests.Session:
@@ -473,6 +474,9 @@ NOTION_VERSION = "2022-06-28"
 DEFAULT_MAX_IMAGE_BYTES = 5_000_000   # Notion free-tier per-file cap.
 MAX_BLOCK_TEXT = 1900                 # Notion paragraph rich_text limit (2000).
 NOTION_PAGE_CHILDREN_CAP = 100        # Notion: max children per create/append call.
+# Document text kept per page. Korean is sent \u-escaped (6 bytes a char), so
+# 30k chars ≈ 180KB, well inside Notion's 500KB request limit with the rest.
+DOC_TEXT_PAGE_CHARS = 30_000
 
 
 # ---------------------------------------------------------------- attachments
@@ -494,6 +498,27 @@ def media_url(obj: dict[str, Any]) -> str:
         if isinstance(url, str) and url:
             return url
     return ""
+
+
+def fetch_capped(sess: Any, url: str, limit: int, timeout: int) -> bytes | None:
+    """Download ``url``, giving up (``None``) once it passes ``limit`` bytes.
+
+    ``file_size`` can be missing or wrong, so the body is streamed instead of
+    trusting it; HTTP errors raise like ``raise_for_status``.
+    """
+    r = sess.get(url, timeout=timeout, stream=True)
+    try:
+        r.raise_for_status()
+        buf = bytearray()
+        for chunk in r.iter_content(64 * 1024):
+            buf += chunk
+            if len(buf) > limit:
+                return None
+        return bytes(buf)
+    finally:
+        close = getattr(r, "close", None)
+        if close:
+            close()
 
 
 def video_objects(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1249,50 +1274,59 @@ class NotionMirror:
         obj: dict[str, Any],
         kidsnote_sess: requests.Session,
         kind: str,  # "video" or "file"
-    ) -> tuple[str | None, dict[str, Any] | None]:
+    ) -> tuple[str | None, dict[str, Any] | None, str]:
         """Upload one video / file, or say why not.
 
-        Returns ``(file_upload_id, None)`` on success, ``(None, link)`` when it
-        can't go into Notion but the page should link the kidsnote original,
-        and ``(None, None)`` when there is nothing to link (no URL at all).
-        ``link`` is ``{kind, name, size, url, reason}`` with reason
-        ``"too_big"`` (over the per-file cap) or ``"failed"``.
+        Returns ``(file_upload_id, link, text)``: the upload id on success, a
+        ``link`` when it can't go into Notion but the page should link the
+        kidsnote original (``{kind, name, size, url, reason}``, reason
+        ``"too_big"`` or ``"failed"``), and for documents (PDF / HWP / …) the
+        text inside, for the page and Notion search (see doc_text.py).
 
-        Over-cap files are recognised from kidsnote's ``file_size`` before
-        downloading, so a 50MB video isn't fetched just to be thrown away.
+        Over-cap videos are recognised from kidsnote's ``file_size`` and never
+        downloaded. Over-cap documents up to 20MB are still fetched, only to
+        read their text.
         """
         url = media_url(obj)
         name = media_name(obj, kind)
         size = declared_size(obj)
         if not url:
-            return None, None
+            return None, None, ""
 
         def link(reason: str, n_bytes: int | None) -> dict[str, Any]:
             return {"kind": kind, "name": name, "size": n_bytes, "url": url, "reason": reason}
 
-        if size is not None and size > self.max_image_bytes:
-            _LOGGER.info(
-                "%s %s is %s, over the %s Notion file limit: linking the kidsnote original instead",
-                kind, name, format_mb(size), cap_label(self.max_image_bytes),
-            )
-            return None, link("too_big", size)
+        def too_big(n_bytes: int) -> bool:
+            if n_bytes > self.max_image_bytes:
+                _LOGGER.info(
+                    "%s %s is %s, over the %s Notion file limit: linking the kidsnote original instead",
+                    kind, name, format_mb(n_bytes), cap_label(self.max_image_bytes),
+                )
+                return True
+            return False
+
+        wants_text = (kind == "file" and doc_text.can_extract(name)
+                      and (size is None or size <= doc_text.MAX_INPUT_BYTES))
+        if size is not None and not wants_text and too_big(size):
+            return None, link("too_big", size), ""
+        limit = doc_text.MAX_INPUT_BYTES if wants_text else self.max_image_bytes
         try:
-            resp = kidsnote_sess.get(url, timeout=180)
-            resp.raise_for_status()
-            raw = resp.content
+            raw = fetch_capped(kidsnote_sess, url, limit, 180)
         except Exception as e:
             _LOGGER.warning("%s download failed (%s): %s", kind, _safe_url(url), _safe_err(e))
-            return None, link("failed", size)
-        if len(raw) > self.max_image_bytes:
-            _LOGGER.info(
-                "%s %s is %s, over the %s Notion file limit: linking the kidsnote original instead",
-                kind, name, format_mb(len(raw)), cap_label(self.max_image_bytes),
-            )
-            return None, link("too_big", len(raw))
+            known_big = size is not None and size > self.max_image_bytes
+            return None, link("too_big" if known_big else "failed", size), ""
+        if raw is None:  # bigger than anything we'd keep
+            too_big(limit + 1)
+            return None, link("too_big", size), ""
+        text = doc_text.extract_text(raw, name) if wants_text else ""
+        real_size = max(len(raw), size or 0)
+        if too_big(real_size):
+            return None, link("too_big", real_size), text
         fid = self._upload_one_blob(raw, name, kind=kind)
         if fid:
-            return fid, None
-        return None, link("failed", len(raw))
+            return fid, None, text
+        return None, link("failed", len(raw)), text
 
     def _upload_media(
         self,
@@ -1302,8 +1336,9 @@ class NotionMirror:
         """Upload every photo / video / file of a report, notice or album.
 
         Returns ``{image_ids, images_failed, video_ids, videos_failed,
-        file_ids, files_failed, links}``; ``file_ids`` holds ``(id, name)``
-        pairs and ``links`` the videos / files that stay on kidsnote (see
+        file_ids, files_failed, links, texts}``; ``file_ids`` holds
+        ``(id, name)`` pairs, ``links`` the videos / files that stay on
+        kidsnote and ``texts`` ``(name, text)`` of readable documents (see
         ``_upload_blob_or_link``).
         """
         image_ids: list[str] = []
@@ -1339,11 +1374,13 @@ class NotionMirror:
             "image_ids": image_ids, "images_failed": images_failed,
             "video_ids": [], "videos_failed": 0,
             "file_ids": [], "files_failed": 0,
-            "links": [],
+            "links": [], "texts": [],
         }
         for kind, objs in (("video", video_objects(item)), ("file", file_objects(item))):
             for obj in objs:
-                fid, link = self._upload_blob_or_link(obj, kidsnote_sess, kind)
+                fid, link, text = self._upload_blob_or_link(obj, kidsnote_sess, kind)
+                if text:
+                    out["texts"].append((media_name(obj, kind), text))
                 if fid and kind == "video":
                     out["video_ids"].append(fid)
                 elif fid:
@@ -1402,10 +1439,13 @@ class NotionMirror:
         video_ids: list[str],
         file_ids: list[tuple[str, str]],
         links: list[dict[str, Any]] | None = None,
+        texts: list[tuple[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
         """사진 / 동영상 / 첨부 파일 sections. A section also appears when all
-        its files stayed on kidsnote, so the links have a place to live."""
+        its files stayed on kidsnote, so the links have a place to live.
+        Readable documents get a collapsed toggle with their text."""
         links = links or []
+        texts = texts or []
         video_links = [ln for ln in links if ln["kind"] == "video"]
         file_links = [ln for ln in links if ln["kind"] == "file"]
 
@@ -1434,7 +1474,7 @@ class NotionMirror:
                     "video": {"type": "file_upload", "file_upload": {"id": fid}},
                 })
             blocks.extend(self._media_link_blocks(video_links))
-        if file_ids or file_links:
+        if file_ids or file_links or texts:
             blocks.append(heading("첨부 파일"))
             for fid, fname in file_ids:
                 blocks.append({
@@ -1447,7 +1487,48 @@ class NotionMirror:
                     },
                 })
             blocks.extend(self._media_link_blocks(file_links, how_to=not video_links))
+            budget = DOC_TEXT_PAGE_CHARS
+            for name, text in texts:
+                if budget <= 0:
+                    break
+                blocks.append(self._doc_text_toggle(name, text, budget))
+                budget -= len(text)
         return blocks
+
+    def _doc_text_toggle(self, name: str, text: str, budget: int) -> dict[str, Any]:
+        """Collapsed '📄 <file> 글 내용' toggle holding a document's text.
+
+        ``budget`` caps the characters so a page stays well inside Notion's
+        request size limit; cut text ends with a pointer to the original.
+        """
+        if len(text) > budget:
+            text = text[:budget].rstrip() + "\n… (이후 내용은 원본 파일에서 확인하세요)"
+        children: list[dict[str, Any]] = [self._para(
+            "첨부 파일의 글자만 옮겼어요. 표 모양·그림은 원본 파일에서 확인하세요.", color="gray",
+        )]
+        chunk = ""
+        for line in text.split("\n"):
+            while len(line) > MAX_BLOCK_TEXT:
+                if chunk:
+                    children.append(self._para(chunk))
+                    chunk = ""
+                children.append(self._para(line[:MAX_BLOCK_TEXT]))
+                line = line[MAX_BLOCK_TEXT:]
+            if chunk and len(chunk) + 1 + len(line) > MAX_BLOCK_TEXT:
+                children.append(self._para(chunk))
+                chunk = line
+            else:
+                chunk = f"{chunk}\n{line}" if chunk else line
+        if chunk:
+            children.append(self._para(chunk))
+        return {
+            "object": "block",
+            "type": "toggle",
+            "toggle": {
+                "rich_text": [{"type": "text", "text": {"content": f"📄 {name[:150]} — 글 내용"}}],
+                "children": children[:NOTION_PAGE_CHILDREN_CAP],
+            },
+        }
 
     def _create_page(
         self,
@@ -1604,6 +1685,7 @@ class NotionMirror:
         video_upload_ids: list[str],
         file_upload_ids: list[tuple[str, str]],  # list of (id, filename)
         media_links: list[dict[str, Any]] | None = None,
+        media_texts: list[tuple[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
 
@@ -1722,7 +1804,7 @@ class NotionMirror:
 
         # 사진 / 동영상 / 첨부 파일 (+ links to files left on kidsnote)
         blocks.extend(self._attachment_blocks(
-            image_upload_ids, video_upload_ids, file_upload_ids, media_links,
+            image_upload_ids, video_upload_ids, file_upload_ids, media_links, media_texts,
         ))
 
         return blocks
@@ -2805,7 +2887,7 @@ class NotionMirror:
 
         children = self._build_children(
             report, media["image_ids"], media["video_ids"], media["file_ids"],
-            media["links"],
+            media["links"], media["texts"],
         )
 
         # Append life-record chips to the meta paragraph (first gray paragraph).
@@ -2902,6 +2984,7 @@ class NotionMirror:
                 blocks.append(self._para(chunk))
         blocks.extend(self._attachment_blocks(
             media["image_ids"], media["video_ids"], media["file_ids"], media["links"],
+            media["texts"],
         ))
 
         # ---- Append comments (parent + teacher replies) at the end ----
@@ -2946,6 +3029,7 @@ class NotionMirror:
             "files_uploaded": len(media["file_ids"]),
             "files_failed": media["files_failed"],
             "media_links": len(media["links"]),
+            "doc_texts": len(media["texts"]),
         }
 
     def publish_notice(

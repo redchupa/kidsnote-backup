@@ -25,6 +25,8 @@ from datetime import date, datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 REQUEST_LOOKBACK_DAYS = 30   # 🎒 list: posts from the last 30 days
+MAX_REQUESTS_PER_POST = 15   # a long attached plan must not flood the board
+MAX_EVENTS_PER_POST = 40
 EVENT_LOOKBACK_DAYS = 60     # 📅 list: read posts from the last 60 days …
 EVENT_AHEAD_DAYS = 60        # … for events dated today through 60 days ahead
 MAX_LINE = 300               # quoted text is cut at a word boundary past this
@@ -255,13 +257,13 @@ def build_board(posts: list[Post], today: date | None = None) -> Board:
         if p.posted > today:
             continue
         if p.posted >= today - timedelta(days=REQUEST_LOOKBACK_DAYS):
-            for s in request_sentences(p.text):
+            for s in request_sentences(p.text)[:MAX_REQUESTS_PER_POST]:
                 key = (p.item_id, s)
                 if key not in seen_req:
                     seen_req.add(key)
                     board.requests.append(Request(p.posted, p.source, s, p.item_id, p.page_id))
         if p.posted >= today - timedelta(days=EVENT_LOOKBACK_DAYS):
-            for start, end, shown in event_lines(p.text, p.posted, p.title):
+            for start, end, shown in event_lines(p.text, p.posted, p.title)[:MAX_EVENTS_PER_POST]:
                 if end < today or start > today + timedelta(days=EVENT_AHEAD_DAYS):
                     continue
                 key = (start, end, shown)
@@ -280,12 +282,16 @@ def posts_from_kidsnote(
     page_ids: dict[int, str],
     comments_of,
     today: date | None = None,
+    attachment_texts_of=None,
 ) -> list[Post]:
     """Turn fetched reports / notices into the posts the board reads.
 
     Only teacher / center text is used. ``comments_of(kind, item)`` returns
     an item's comments; it is called only for items inside the lookback
     window that have comments, so a quiet run costs a few requests at most.
+    ``attachment_texts_of(item)`` returns ``(file name, text)`` of the
+    documents attached to a teacher post in the window (monthly plans and
+    가정통신문 often live there rather than in the post).
     """
     today = today or today_kst()
     oldest = today - timedelta(days=max(REQUEST_LOOKBACK_DAYS, EVENT_LOOKBACK_DAYS))
@@ -307,6 +313,11 @@ def posts_from_kidsnote(
                 if kind == "notices" and item.get("title"):
                     text = f"{item['title']}\n{text}"
                 posts.append(Post(label, item_id, posted, text, item.get("title") or "", page_id))
+                if attachment_texts_of and item.get("attached_files"):
+                    for name, doc in attachment_texts_of(item):
+                        short = name if len(name) <= 24 else name[:23] + "…"
+                        posts.append(Post(f"첨부({short})", item_id, posted, doc,
+                                          item.get("title") or "", page_id))
             for c in comments:
                 if ((c.get("author") or {}).get("type") or "").lower() not in TEACHER_TYPES:
                     continue

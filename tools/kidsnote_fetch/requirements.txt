@@ -1,3 +1,5 @@
 requests>=2.31
 browser-cookie3>=0.20
 kiwipiepy>=0.17
+pypdf>=6.0,<8
+olefile>=0.46,<1

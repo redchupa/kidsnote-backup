@@ -497,6 +497,9 @@ def _live_page_ids(
 
 
 SUPPLIES_COMMENT_RESERVE_SEC = 5 * 60   # stop comment lookups this close to the cap
+# Attached documents re-read per run for the 📋 board (newest posts first):
+# enough for a month of plans / 가정통신문, small enough to stay cheap every 6h.
+SUPPLIES_MAX_ATTACHMENTS = 12
 
 
 def _publish_supplies(
@@ -512,7 +515,9 @@ def _publish_supplies(
     minutes of its time cap, so a slow kidsnote can't push the run over it.
     """
     try:
+        import doc_text
         import supplies
+        from notion_mirror import declared_size, fetch_capped, file_objects, media_name, media_url
         lookups = 0
 
         def comments_of(kind: str, item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -522,14 +527,42 @@ def _publish_supplies(
             lookups += 1
             return mirror._fetch_comments(sess, kind, int(item["id"]))
 
-        posts = supplies.posts_from_kidsnote(reports, notices, page_ids, comments_of)
+        downloads = 0
+
+        def attachment_texts_of(item: dict[str, Any]) -> list[tuple[str, str]]:
+            """Text of the readable documents attached to a teacher post."""
+            nonlocal downloads
+            out: list[tuple[str, str]] = []
+            for obj in file_objects(item):
+                name, url, size = media_name(obj, "file"), media_url(obj), declared_size(obj)
+                if not (url and doc_text.can_extract(name)):
+                    continue
+                if size is not None and size > doc_text.MAX_INPUT_BYTES:
+                    continue
+                if (downloads >= SUPPLIES_MAX_ATTACHMENTS
+                        or _remaining_budget() < SUPPLIES_COMMENT_RESERVE_SEC):
+                    break
+                downloads += 1
+                try:
+                    raw = fetch_capped(sess, url, doc_text.MAX_INPUT_BYTES, 60)
+                except Exception as e:
+                    _LOGGER.info("📋 attachment %s not read: %s", name, _safe_err(e))
+                    continue
+                text = doc_text.extract_text(raw or b"", name)
+                if text:
+                    out.append((name, text))
+            return out
+
+        posts = supplies.posts_from_kidsnote(reports, notices, page_ids, comments_of,
+                                             attachment_texts_of=attachment_texts_of)
         board = supplies.build_board(posts)
         titles = {int(n["id"]): (n.get("title") or "").strip()
                   for n in notices if n.get("id") is not None}
         mirror.publish_supplies(board, titles)
         _LOGGER.info(
             "📋 Supplies page updated (%d upcoming dates, %d requests; %d posts read, "
-            "%d comment lookups)", len(board.events), len(board.requests), len(posts), lookups,
+            "%d comment lookups, %d attachments read)", len(board.events), len(board.requests),
+            len(posts), lookups, downloads,
         )
     except Exception as e:
         _LOGGER.warning("supplies publish failed: %s", _safe_err(e))
@@ -986,6 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
                     parts.append(f"file={res['files_uploaded']}/{file_tot}")
                 if res.get("media_links"):
                     parts.append(f"kidsnote-link={res['media_links']}")
+                if res.get("doc_texts"):
+                    parts.append(f"doc-text={res['doc_texts']}")
                 attach_str = (" " + " ".join(parts)) if parts else ""
                 _LOGGER.info(
                     "%s %5.1f%% (%d/%d) | Notion +1 id=%d%s",
