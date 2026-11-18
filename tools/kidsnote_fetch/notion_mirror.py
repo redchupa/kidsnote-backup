@@ -3170,6 +3170,9 @@ class NotionMirror:
     INTERESTS_TITLE = "_4 🌱 분기별 관심사"
     TEACHER_THANKS_REPORT_ID = -7
     TEACHER_THANKS_TITLE = "_4 💌 연도별 선생님께"
+    # Rule-based (no LLM) 🎒 requests + 📅 upcoming dates, see supplies.py.
+    SUPPLIES_REPORT_ID = -8
+    SUPPLIES_TITLE = "_5 📋 준비물·일정"
 
     @classmethod
     def _dashboard_title(cls, template: str) -> str:
@@ -3491,10 +3494,7 @@ class NotionMirror:
             rich: list[dict[str, Any]] = []
             if o.get("date"):
                 rich.append({"type": "text", "text": {"content": f"{o['date']} · "}})
-            source: dict[str, Any] = {"content": o.get("source") or "키즈노트"}
-            if o.get("page_id"):
-                source["link"] = {"url": notion_page_url(o["page_id"])}
-            rich.append({"type": "text", "text": source})
+            rich.append(self._page_link_rt(o.get("source") or "키즈노트", o.get("page_id") or ""))
             icon = "🎬" if o.get("kind") == "video" else "📄"
             rich.append({"type": "text", "text": {"content": f" · {icon} "}})
             name: dict[str, Any] = {"content": (o.get("name") or "")[:200]}
@@ -3630,6 +3630,106 @@ class NotionMirror:
 
 
     # ----------------------------------------------------------- LLM dashboards
+
+    # ----------------------------------------------------------- 📋 준비물·일정
+
+    _WEEKDAY_KO = "월화수목금토일"
+
+    @classmethod
+    def _md(cls, d: Any, *, weekday: bool = True) -> str:
+        """date → '11/20(금)' (or '11/20')."""
+        text = f"{d.month}/{d.day}"
+        return f"{text}({cls._WEEKDAY_KO[d.weekday()]})" if weekday else text
+
+    @staticmethod
+    def _page_link_rt(label: str, page_id: str, color: str | None = None) -> dict[str, Any]:
+        """Rich text ``label``, linked to the Notion page when its id is known."""
+        text: dict[str, Any] = {"content": label}
+        if page_id:
+            text["link"] = {"url": notion_page_url(page_id)}
+        rt: dict[str, Any] = {"type": "text", "text": text}
+        if color:
+            rt["annotations"] = {"color": color}
+        return rt
+
+    @classmethod
+    def _source_rt(cls, source: str, title: str, page_id: str) -> dict[str, Any]:
+        """'알림장' / '공지: 11월 3주 가정통신문', linked to its Notion page."""
+        label = source
+        if title:
+            short = title if len(title) <= 30 else title[:30].rstrip() + "…"
+            label = f"{source}: {short}"
+        return cls._page_link_rt(label, page_id, "gray")
+
+    def _supplies_blocks(self, board: Any, titles: dict[int, str]) -> list[dict[str, Any]]:
+        """Body of the 📋 page from a ``supplies.Board``. ``titles`` maps a
+        notice id to its title so short lines (``* 준비물 : 원복``) say which
+        notice they belong to."""
+        from supplies import EVENT_AHEAD_DAYS, REQUEST_LOOKBACK_DAYS, KST
+
+        def bullet(rich: list[dict[str, Any]]) -> dict[str, Any]:
+            return {"object": "block", "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich}}
+
+        def plain(text: str, **ann: Any) -> dict[str, Any]:
+            rt: dict[str, Any] = {"type": "text", "text": {"content": text}}
+            if ann:
+                rt["annotations"] = ann
+            return rt
+
+        blocks: list[dict[str, Any]] = [{
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": [plain(
+                    "선생님·원에서 쓴 글과 댓글에서 준비물·요청 문장과 날짜가 적힌 일정을 "
+                    "원문 그대로 모았어요. 오른쪽 링크를 누르면 원래 글이 열려요.\n"
+                    f"마지막 갱신: {datetime.now(KST).strftime('%Y-%m-%d %H:%M')}"
+                )],
+                "icon": {"type": "emoji", "emoji": "📋"},
+                "color": "blue_background",
+            },
+        }]
+
+        blocks.append(self._h2(f"📅 다가오는 일정 ({len(board.events)})"))
+        if not board.events:
+            blocks.append(self._para(
+                f"앞으로 {EVENT_AHEAD_DAYS}일 안의 날짜가 적힌 일정이 없어요.", color="gray"))
+        for e in board.events:
+            when = self._md(e.start)
+            if e.end != e.start:
+                when += f"–{self._md(e.end)}"
+            rich = []
+            if e.start <= board.today <= e.end:
+                rich.append(plain("오늘 ", bold=True, color="red"))
+            rich += [plain(when, bold=True), plain(f" · {e.text} · "),
+                     self._source_rt(e.source, titles.get(e.item_id, ""), e.page_id)]
+            blocks.append(bullet(rich))
+
+        blocks.append(self._h2(f"🎒 준비물·요청 — 최근 {REQUEST_LOOKBACK_DAYS}일 ({len(board.requests)})"))
+        if not board.requests:
+            blocks.append(self._para(
+                f"최근 {REQUEST_LOOKBACK_DAYS}일 동안 선생님 글에서 찾은 요청이 없어요.", color="gray"))
+        for r in board.requests:
+            rich = [plain(self._md(r.posted, weekday=False), bold=True),
+                    plain(f" · {r.text} · "),
+                    self._source_rt(r.source, titles.get(r.item_id, ""), r.page_id)]
+            blocks.append(bullet(rich))
+
+        blocks.append(self._para(
+            "글에 적힌 문장을 그대로 옮겨요. '다음 주 월요일'처럼 날짜 숫자 없이 적힌 일정은 "
+            "📅에 나오지 않으니 🎒 목록도 함께 확인하세요.",
+            color="gray",
+        ))
+        return blocks
+
+    def publish_supplies(self, board: Any, titles: dict[int, str]) -> dict[str, Any] | None:
+        """Replace the singleton ``📋 준비물·일정`` page."""
+        return self._replace_singleton(
+            self.SUPPLIES_REPORT_ID,
+            self._dashboard_title(self.SUPPLIES_TITLE),
+            self._supplies_blocks(board, titles),
+        )
 
     def _replace_singleton(
         self,

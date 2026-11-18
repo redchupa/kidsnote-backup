@@ -496,6 +496,45 @@ def _live_page_ids(
     return out
 
 
+SUPPLIES_COMMENT_RESERVE_SEC = 5 * 60   # stop comment lookups this close to the cap
+
+
+def _publish_supplies(
+    mirror: Any,
+    sess: requests.Session,
+    reports: list[dict[str, Any]],
+    notices: list[dict[str, Any]],
+    page_ids: dict[int, str],
+) -> None:
+    """📋 준비물·일정 page. Never fails the run: any error is a warning.
+
+    Comment lookups (a handful per run) stop when the job is within a few
+    minutes of its time cap, so a slow kidsnote can't push the run over it.
+    """
+    try:
+        import supplies
+        lookups = 0
+
+        def comments_of(kind: str, item: dict[str, Any]) -> list[dict[str, Any]]:
+            nonlocal lookups
+            if _remaining_budget() < SUPPLIES_COMMENT_RESERVE_SEC:
+                return []
+            lookups += 1
+            return mirror._fetch_comments(sess, kind, int(item["id"]))
+
+        posts = supplies.posts_from_kidsnote(reports, notices, page_ids, comments_of)
+        board = supplies.build_board(posts)
+        titles = {int(n["id"]): (n.get("title") or "").strip()
+                  for n in notices if n.get("id") is not None}
+        mirror.publish_supplies(board, titles)
+        _LOGGER.info(
+            "📋 Supplies page updated (%d upcoming dates, %d requests; %d posts read, "
+            "%d comment lookups)", len(board.events), len(board.requests), len(posts), lookups,
+        )
+    except Exception as e:
+        _LOGGER.warning("supplies publish failed: %s", _safe_err(e))
+
+
 def _resolve_secret(env: dict[str, str], key: str) -> str:
     """Read a credential from either the .env file or the process environment.
 
@@ -1112,6 +1151,9 @@ def main(argv: list[str] | None = None) -> int:
         import time as _t
         _t.sleep(2.0)
 
+    # kidsnote id → Notion page, for the 📊 / 📋 links back to each post.
+    live_page_ids = _live_page_ids(page_map, publish_results, args.force_refresh)
+
     # ---- 📊 Stats dashboard ----
     if mirror is not None and reports:
         _LOGGER.info("📊 Dashboard: computing stats from %d reports...", len(reports))
@@ -1175,8 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
         from notion_mirror import attachment_stats
         att = attachment_stats(
             [("알림장", reports), ("공지", notices), ("앨범", albums)],
-            _live_page_ids(page_map, publish_results, args.force_refresh),
-            mirror.max_image_bytes,
+            live_page_ids, mirror.max_image_bytes,
         )
         _LOGGER.info(
             "📎 attachments: %d photos, %d videos, %d files; %d over the %s Notion limit "
@@ -1273,6 +1314,12 @@ def main(argv: list[str] | None = None) -> int:
                          len(item_counter), len(group_counter))
         except Exception as e:
             _LOGGER.warning("nutrition publish failed: %s", e)
+        import time as _t
+        _t.sleep(0.5)
+
+    # ---- 📋 준비물·일정 (rule-based, no LLM; see supplies.py) ----
+    if mirror is not None and (reports or notices):
+        _publish_supplies(mirror, sess, reports, notices, live_page_ids)
         import time as _t
         _t.sleep(0.5)
 
