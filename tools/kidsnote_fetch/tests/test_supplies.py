@@ -216,7 +216,12 @@ class FetchStepTest(unittest.TestCase):
             self.calls.append((kind, item_id))
             return [{"author": {"type": "teacher"}, "content": "우비 보내주세요~", "created": str(date.today())}]
 
-        def publish_supplies(self, board, titles):
+        def sync_calendar(self, board, titles, read):
+            self.calendar_args = (len(board.events), read)
+            return "cal-db"
+
+        def publish_supplies(self, board, titles, calendar_db_id=None):
+            self.calendar_db_id = calendar_db_id
             if self.fail:
                 raise RuntimeError("notion down https://up-kids-kage.kakao.com/dn/SECRET/x.jpg")
             self.published = (board, titles)
@@ -235,6 +240,8 @@ class FetchStepTest(unittest.TestCase):
         self.fetch._publish_supplies(m, None, self.reports, self.notices, {1: "pg"})
         board, titles = m.published
         self.assertEqual(titles, {2: "11월 안내"})
+        self.assertEqual(m.calendar_db_id, "cal-db")
+        self.assertEqual(m.calendar_args[1], {(1, "알림장"), (1, "선생님 댓글"), (2, "공지")})
         self.assertEqual(m.calls, [("reports", 1)])
         self.assertEqual({(r.source, r.page_id) for r in board.requests},
                          {("알림장", "pg"), ("선생님 댓글", "pg"), ("공지", "")})

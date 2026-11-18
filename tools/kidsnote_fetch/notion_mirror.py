@@ -3807,13 +3807,39 @@ class NotionMirror:
         ))
         return blocks
 
-    def publish_supplies(self, board: Any, titles: dict[int, str]) -> dict[str, Any] | None:
-        """Replace the singleton ``📋 준비물·일정`` page."""
+    def publish_supplies(
+        self,
+        board: Any,
+        titles: dict[int, str],
+        calendar_db_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Replace the singleton ``📋 준비물·일정`` page (with a link to the
+        📅 calendar database when there is one)."""
+        blocks = self._supplies_blocks(board, titles)
+        if calendar_db_id:
+            # A plain link: Notion's link_to_page block rejects inline databases
+            # ("database_id must reference a collection_view_page", live 2026-11-18).
+            blocks.insert(1, {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": "📅 날짜가 있는 일정은 "}},
+                    {"type": "text", "text": {"content": "📅 키즈노트 일정",
+                                              "link": {"url": notion_page_url(calendar_db_id)}},
+                     "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": " 달력에도 쌓여요."}},
+                ]},
+            })
         return self._replace_singleton(
             self.SUPPLIES_REPORT_ID,
             self._dashboard_title(self.SUPPLIES_TITLE),
-            self._supplies_blocks(board, titles),
+            blocks,
         )
+
+    def sync_calendar(self, board: Any, titles: dict[int, str], read: set[tuple[int, str]]) -> str | None:
+        """📅 키즈노트 일정 database (see notion_calendar.py); its id or None."""
+        from notion_calendar import CalendarSync
+        return CalendarSync(self).sync(board, titles, read)
 
     def _replace_singleton(
         self,

@@ -558,7 +558,12 @@ def _publish_supplies(
         board = supplies.build_board(posts)
         titles = {int(n["id"]): (n.get("title") or "").strip()
                   for n in notices if n.get("id") is not None}
-        mirror.publish_supplies(board, titles)
+        calendar_id = None
+        try:
+            calendar_id = mirror.sync_calendar(board, titles, {(p.item_id, p.source) for p in posts})
+        except Exception as e:  # the calendar is extra: never block the 📋 page
+            _LOGGER.warning("calendar sync failed: %s", _safe_err(e))
+        mirror.publish_supplies(board, titles, calendar_id)
         _LOGGER.info(
             "📋 Supplies page updated (%d upcoming dates, %d requests; %d posts read, "
             "%d comment lookups, %d attachments read)", len(board.events), len(board.requests),
