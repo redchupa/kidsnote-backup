@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from secret_input import clean_secret, mask_name  # local module
+from secret_input import child_label, clean_secret, mask_name, masked_value, match_children  # local module
 from secret_input import safe_err as _safe_err, safe_url as _safe_url  # local module
 
 try:
@@ -633,19 +633,20 @@ def _pick_child(
             avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in children)
             sys.exit(f"--child-id {child_id} not in your profile. Available: {avail}")
         return match
-    if child_name:
-        needle = clean_secret(child_name).lower()
-        matches = [c for c in children if needle in (c.get("name") or "").lower()]
-        if len(matches) == 0:
-            avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in children)
+    if clean_secret(child_name):
+        # Same rule as preflight.py (secret_input.match_children).
+        outcome, matches = match_children(children, child_name)
+        avail = ", ".join(f"{c.get('id')}={child_label(c)}" for c in children)
+        if outcome == "several":
+            sys.exit(f"--child-name {masked_value(child_name)!r} holds more than one name; "
+                     f"give one child per slot. Available: {avail}")
+        if outcome == "none":
+            sys.exit(f"--child-name {masked_value(child_name)!r} matched no child. Available: {avail}")
+        if outcome == "many":
+            picked = ", ".join(f"{c.get('id')}={child_label(c)}" for c in matches)
             sys.exit(
-                f"--child-name {mask_name(child_name)!r} matched no child. Available: {avail}"
-            )
-        if len(matches) > 1:
-            avail = ", ".join(f"{c.get('id')}={mask_name(c.get('name'))}" for c in matches)
-            sys.exit(
-                f"--child-name {mask_name(child_name)!r} ambiguous ({len(matches)} matches): "
-                f"{avail}. Use --child-id instead for an exact pick."
+                f"--child-name {masked_value(child_name)!r} ambiguous ({len(matches)} matches): "
+                f"{picked}. Use --child-id instead for an exact pick."
             )
         return matches[0]
     if child_index is not None:

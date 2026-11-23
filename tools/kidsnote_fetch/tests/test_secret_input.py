@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import secret_input as si  # noqa: E402
 from secret_input import clean_secret, mask_name, normalize_notion_id, normalize_token  # noqa: E402
 
 ID = "238f5e29c0894adfb6c4d8e1a5b2c3d4"
@@ -60,6 +61,37 @@ class NormalizeNotionIdTest(unittest.TestCase):
         for raw in ("", None, "  ", "not an id", "https://www.notion.so/", "12345", f"?v={VIEW}"):
             with self.subTest(raw=raw):
                 self.assertEqual(normalize_notion_id(raw), "")
+
+
+class ChildNameTest(unittest.TestCase):
+    KIDS = [{"id": 1, "name": "송하정"}, {"id": 2, "name": "송다정"}, {"id": 3, "name": "김민준 "}]
+
+    def ids(self, wanted):
+        outcome, kids = si.match_children(self.KIDS, wanted)
+        return outcome, [k["id"] for k in kids]
+
+    def test_name_key_unifies_how_a_name_can_be_typed(self):
+        import unicodedata
+        for variant in ("송하정", unicodedata.normalize("NFD", "송하정"), " 송 하정 ", "송​하정",
+                        "﻿송하정\n", '"송하정"'):
+            self.assertEqual(si.name_key(variant), "송하정", repr(variant))
+        self.assertEqual(si.name_key("Ｈａｒｉｎ"), "harin")  # full-width, any case
+
+    def test_outcomes(self):
+        self.assertEqual(self.ids(""), ("empty", []))
+        self.assertEqual(self.ids("하정"), ("one", [1]))
+        self.assertEqual(self.ids("민준"), ("one", [3]))
+        self.assertEqual(self.ids("정"), ("many", [1, 2]))
+        self.assertEqual(self.ids("서연"), ("none", []))
+        self.assertEqual(self.ids("송하정, 송다정"), ("several", [1, 2]))
+        self.assertEqual(self.ids("송하정/김민준"), ("several", [1, 3]))
+        self.assertEqual(self.ids("송하정 송다정"), ("several", [1, 2]))
+
+    def test_labels_never_show_a_full_name(self):
+        self.assertEqual(si.child_label({"name": "송하정", "date_birth": "2019-03-02"}), "송*정(2019년생)")
+        self.assertEqual(si.child_label({"name": "송하정"}), "송*정")
+        import unicodedata
+        self.assertEqual(si.masked_value(unicodedata.normalize("NFD", "송하정")), "송*정")
 
 
 class MaskNameTest(unittest.TestCase):

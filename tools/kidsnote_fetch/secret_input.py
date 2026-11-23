@@ -8,6 +8,7 @@ instead of cryptic API errors.
 from __future__ import annotations
 
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 _INVISIBLE = re.compile("[﻿​‌‍⁠]")
@@ -73,6 +74,64 @@ def safe_err(err: BaseException) -> str:
     """``str(err)`` with every URL shortened by ``safe_url``. requests puts the
     full URL in its messages (``404 Client Error: … for url: https://…``)."""
     return _URL_IN_TEXT.sub(lambda m: safe_url(m.group(0)), str(err))
+
+
+# ---------------------------------------------------------------- child names
+#
+# KIDSNOTE_CHILD_NAME is compared with the names kidsnote returns. Issue #3:
+# a parent with three children got "no child matches" for every value they
+# tried. What breaks a plain substring test, all seen in pasted secrets:
+# Korean copied on a Mac is decomposed (NFD: ㅅ+ㅗ+ㅇ looks like 송 but isn't
+# equal), a space inside the name, invisible characters, and several names
+# typed into the one slot ("송하정, 송다정").
+
+_NAME_SEPARATORS = re.compile(r"[,，、/;；·|]")
+
+
+def name_key(value: str | None) -> str:
+    """Comparable form of a name: NFKC, no invisible characters or spaces, case-folded."""
+    text = unicodedata.normalize("NFKC", clean_secret(value))
+    return "".join(_INVISIBLE.sub("", text).split()).casefold()
+
+
+def match_children(children: list[dict], wanted: str | None) -> tuple[str, list[dict]]:
+    """Which children ``wanted`` names, as ``(outcome, children)``.
+
+    outcome: ``"empty"`` (nothing written), ``"one"``, ``"many"`` (it fits
+    several children: write more of the name), ``"none"``, or ``"several"``
+    when the value holds more than one name (each child needs its own slot).
+    Matching is a substring test on ``name_key`` of both sides.
+    """
+    raw = unicodedata.normalize("NFKC", clean_secret(wanted))
+    parts = [name_key(p) for p in _NAME_SEPARATORS.split(raw)]
+    parts = [p for p in parts if p]
+    if not parts:
+        return "empty", []
+    if len(parts) > 1:
+        return "several", [c for c in children if any(p in name_key(c.get("name")) for p in parts)]
+    matches = [c for c in children if parts[0] in name_key(c.get("name"))]
+    if len(matches) == 1:
+        return "one", matches
+    if matches:
+        return "many", matches
+    # "송하정 송다정": names separated by spaces only.
+    words = [name_key(w) for w in raw.split()]
+    named = [c for c in children if any(len(w) >= 2 and w in name_key(c.get("name")) for w in words)]
+    if len(words) > 1 and len(named) > 1:
+        return "several", named
+    return "none", []
+
+
+def masked_value(value: str | None) -> str:
+    """What was written, masked like a child's name ('송*정'), for messages."""
+    return mask_name(unicodedata.normalize("NFC", clean_secret(value)))
+
+
+def child_label(child: dict) -> str:
+    """'송*정(2019년생)': masked name plus birth year, so same-looking names differ."""
+    label = mask_name(child.get("name"))
+    year = str(child.get("date_birth") or "")[:4]
+    return f"{label}({year}년생)" if year.isdigit() else label
 
 
 def mask_name(name: str | None) -> str:

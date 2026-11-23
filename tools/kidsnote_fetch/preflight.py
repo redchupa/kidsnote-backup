@@ -19,7 +19,7 @@ from typing import Any
 
 import kidsnote_auth
 import notion_check
-from secret_input import clean_secret, mask_name
+from secret_input import child_label, mask_name, masked_value, match_children
 
 UNEXPECTED_HINT = "사전 점검 중 예상하지 못한 오류가 났습니다. 잠시 후 다시 실행해 보고, 계속되면 이슈로 알려 주세요."
 
@@ -36,21 +36,25 @@ def pick_child(children: list[dict[str, Any]], wanted: str | None) -> dict[str, 
     """The child KIDSNOTE_CHILD_NAME refers to (same rule as fetch.py: case-insensitive substring)."""
     if not children:
         raise CheckFailed("child_none", "이 키즈노트 계정에 등록된 자녀가 없습니다. 키즈노트 앱에서 자녀 등록 상태를 확인해 주세요.")
-    listed = ", ".join(mask_name(c.get("name")) for c in children)
-    needle = clean_secret(wanted).lower()
-    if not needle:
+    listed = ", ".join(child_label(c) for c in children)
+    outcome, matches = match_children(children, wanted)
+    if outcome == "empty":
         if len(children) == 1:
             return children[0]
         raise CheckFailed("child_name_required",
                           f"자녀가 {len(children)}명입니다({listed}). "
                           "KIDSNOTE_CHILD_NAME 시크릿에 백업할 자녀 이름을 적어 주세요.")
-    matches = [c for c in children if needle in (c.get("name") or "").lower()]
-    if not matches:
+    if outcome == "several":
+        raise CheckFailed("child_name_multiple",
+                          "KIDSNOTE_CHILD_NAME 에는 자녀 한 명의 이름만 적어 주세요. "
+                          "다른 자녀는 KIDSNOTE_CHILD_NAME_2 · NOTION_DATABASE_ID_2 처럼 번호를 붙여 "
+                          f"따로 등록합니다 (안내서 'A. 자녀가 여러 명일 때'). 이 계정의 자녀: {listed}.")
+    if outcome == "none":
         raise CheckFailed("child_not_found",
-                          f"KIDSNOTE_CHILD_NAME 과 일치하는 자녀가 없습니다. 이 계정의 자녀: {listed}. "
-                          "시크릿 값을 자녀 이름(일부만 적어도 됨)으로 고쳐 주세요.")
-    if len(matches) > 1:
-        both = ", ".join(mask_name(c.get("name")) for c in matches)
+                          f"KIDSNOTE_CHILD_NAME 과 일치하는 자녀가 없습니다. 적은 값: {masked_value(wanted)}. "
+                          f"이 계정의 자녀: {listed}. 시크릿 값을 자녀 이름(일부만 적어도 됨)으로 고쳐 주세요.")
+    if outcome == "many":
+        both = ", ".join(child_label(c) for c in matches)
         raise CheckFailed("child_ambiguous",
                           f"KIDSNOTE_CHILD_NAME 이 자녀 여러 명({both})과 일치합니다. 더 긴 이름으로 적어 주세요.")
     return matches[0]

@@ -114,6 +114,27 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("우*린, 우*준", outputs["hint"])
         self.assertNotIn("우하린", out + outputs["hint"])
 
+    def test_issue_3_three_children_with_look_alike_names(self):
+        """Issue #3: three children shown as 송*정, 송*정, 송*정 and nothing matched."""
+        import unicodedata
+        self.kn.children = [{"id": 1, "name": "송하정", "date_birth": "2019-03-02"},
+                            {"id": 2, "name": "송다정", "date_birth": "2021-05-01"},
+                            {"id": 3, "name": "송예정", "date_birth": "2023-01-09"}]
+        # Korean copied on a Mac is decomposed (NFD) but must still match.
+        self.assertEqual(self.run_main(KIDSNOTE_CHILD_NAME=unicodedata.normalize("NFD", "다정"))[3], {"ok": "true"})
+        self.assertEqual(self.run_main(KIDSNOTE_CHILD_NAME="송 예정")[3], {"ok": "true"})
+        # All three names in one slot: say so, and point to the numbered slots.
+        for value in ("송하정, 송다정, 송예정", "송하정 송다정"):
+            _, out, env, outputs = self.run_main(KIDSNOTE_CHILD_NAME=value)
+            self.assertFailed(outputs, env, "child_name_multiple")
+            self.assertIn("KIDSNOTE_CHILD_NAME_2", outputs["hint"])
+        # Not found: show the masked value written and tell the children apart by birth year.
+        _, out, env, outputs = self.run_main(KIDSNOTE_CHILD_NAME="민준")
+        self.assertFailed(outputs, env, "child_not_found")
+        self.assertIn("적은 값: 민*", outputs["hint"])
+        self.assertIn("송*정(2019년생), 송*정(2021년생), 송*정(2023년생)", outputs["hint"])
+        self.assertNotIn("송하정", out + outputs["hint"])
+
     def test_ambiguous_child_name(self):
         self.kn.children = [{"id": 11, "name": "우하린"}, {"id": 12, "name": "우하준"}]
         _, _, env, outputs = self.run_main(KIDSNOTE_CHILD_NAME="우하")
